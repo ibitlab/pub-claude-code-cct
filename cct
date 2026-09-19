@@ -1,0 +1,988 @@
+#!/usr/bin/env -S -u PYTHONHOME -u PYTHONPATH python3
+"""cct — interactive TUI for Claude Code session transcripts.
+
+Wraps the sibling bash scripts (list-sessions / session-stats / session-tools /
+session-questions / dead-sessions) behind an arrow-key menu so nothing needs
+typing by hand.
+
+Uses only the Python stdlib (curses) — no pip install required.
+"""
+from __future__ import annotations
+
+import curses
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+SUBPROCESS_TIMEOUT = 60  # seconds; bash scripts do heavy jq passes on long transcripts
+
+# ncurses waits ~1s after Esc by default to disambiguate it from arrow-key
+# escape sequences. That delay makes users mash Esc and accidentally pop
+# through multiple menu levels. 25ms is imperceptible and still longer than
+# any real escape sequence takes to arrive over a local PTY.
+os.environ.setdefault("ESCDELAY", "25")
+
+# Strip dangerous ANSI sequences from subprocess / transcript output before
+# echoing it to the user's TTY. We KEEP SGR (color / style) codes because
+# they can only change how characters render — passing them through lets our
+# scripts (and tool output in transcripts) emit legitimate colors. Everything
+# else is removed: other CSI (cursor moves, screen clears), OSC (window
+# title, OSC-52 clipboard writes, hyperlinks), and lone ESC + Fe sequences
+# could be used to forge prompts or hijack the terminal if echoed verbatim.
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"          # CSI (any final byte)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)" # OSC terminated by BEL or ST
+    r"|\x1b[@-_]"                          # lone ESC + Fe
+)
+def _filter_ansi(match: re.Match) -> str:
+    # Keep only SGR: CSI with final 'm'. Strip everything else.
+    s = match.group(0)
+    return s if s.startswith("\x1b[") and s.endswith("m") else ""
+def strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub(_filter_ansi, text)
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+STATE_FILE = Path.home() / ".cache" / "cct" / "state.json"
+
+# ---------- state ----------
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_state(state: dict) -> None:
+    # Private-by-default — the file is harmless today but may grow to hold
+    # paths / session ids that shouldn't leak via world-readable ~/.cache.
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(state))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)  # atomic — no torn writes on SIGINT
+
+# ---------- session discovery (native; avoids N subprocess calls) ----------
+
+@dataclass
+class Session:
+    id: str
+    jsonl: Path
+    first: str | None
+    last: str | None
+    events: int   # raw jsonl line count — every log entry
+    turns: int    # user round trips — counted from `last-prompt` snapshots
+    title: str | None
+    first_prompt: str | None
+    last_prompt: str | None
+    cwd: str | None
+
+    @property
+    def short_id(self) -> str:
+        return self.id[:8]
+
+    @property
+    def headline(self) -> str:
+        return self.title or self.first_prompt or self.last_prompt or "<no prompt>"
+
+def slug_for(path: Path) -> str:
+    """Mirror the slug rule in list-sessions.sh: '/' and '_' → '-'."""
+    return str(path).replace("/", "-").replace("_", "-")
+
+def parse_jsonl(jsonl: Path) -> Session | None:
+    first_ts = last_ts = title = first_prompt = last_prompt = cwd = None
+    events = 0
+    turns = 0
+    try:
+        with jsonl.open() as f:
+            for line in f:
+                events += 1
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = ev.get("timestamp")
+                if ts:
+                    if first_ts is None:
+                        first_ts = ts
+                    last_ts = ts
+                if cwd is None and ev.get("cwd"):
+                    cwd = ev["cwd"]
+                t = ev.get("type")
+                if t == "ai-title":
+                    title = ev.get("aiTitle") or title
+                elif t == "last-prompt":
+                    # Each last-prompt event is a snapshot appended when the
+                    # user submits a new typed prompt → count = round trips.
+                    turns += 1
+                    p = ev.get("lastPrompt")
+                    if p:
+                        if first_prompt is None:
+                            first_prompt = p
+                        last_prompt = p
+    except OSError:
+        return None
+    if events == 0:
+        return None
+    return Session(
+        id=jsonl.stem, jsonl=jsonl, first=first_ts, last=last_ts,
+        events=events, turns=turns,
+        title=title, first_prompt=first_prompt, last_prompt=last_prompt, cwd=cwd,
+    )
+
+def sessions_in(project_dir: Path) -> list[Session]:
+    if not project_dir.is_dir():
+        return []
+    out = [s for s in (parse_jsonl(p) for p in project_dir.glob("*.jsonl")) if s]
+    out.sort(key=lambda s: s.last or "", reverse=True)
+    return out
+
+def all_sessions() -> list[Session]:
+    out: list[Session] = []
+    if not PROJECTS_ROOT.is_dir():
+        return out
+    for d in PROJECTS_ROOT.iterdir():
+        if d.is_dir():
+            out.extend(sessions_in(d))
+    out.sort(key=lambda s: s.last or "", reverse=True)
+    return out
+
+# ---------- shell-out helpers ----------
+
+def run_script(name: str, *args: str) -> str:
+    path = SCRIPT_DIR / name
+    if not path.exists():
+        return f"[error] missing script: {path}\n"
+    # Loading indicator for scripts that can take several seconds on large
+    # transcripts (cost-report, stack-report, dead-sessions -v).  `\r` puts
+    # the spinner on the same row that will be overwritten by the banner.
+    _spinner = f"… running {name} {' '.join(args)}".rstrip()
+    try:
+        if sys.stdout.isatty():
+            sys.stdout.write(_spinner + "\r")
+            sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        proc = subprocess.run(
+            [str(path), *args],
+            capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as e:
+        stdout = (e.stdout or b"").decode("utf-8", errors="replace")
+        _clear_line()
+        return stdout.rstrip() + f"\n\n[timed out after {SUBPROCESS_TIMEOUT}s]\n"
+    _clear_line()
+    out = proc.stdout
+    if proc.stderr:
+        out = (out + "\n" if out else "") + proc.stderr
+    return out.rstrip() + "\n"
+
+def _clear_line():
+    try:
+        if sys.stdout.isatty():
+            # CR + enough spaces + CR, so whatever the spinner wrote gets wiped.
+            sys.stdout.write("\r" + " " * 80 + "\r")
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+# ---------- formatting ----------
+
+def fmt_ts(iso: str | None) -> str:
+    """'2026-04-17T15:26:32.334Z' → '04-17 15:26'."""
+    if not iso or len(iso) < 16:
+        return "?"
+    return f"{iso[5:10]} {iso[11:16]}"
+
+def truncate(s: str, n: int) -> str:
+    return s if len(s) <= n else s[: max(0, n - 1)] + "…"
+
+def session_row(s: Session, with_project: bool, width: int):
+    """Return a single label string (single-project mode) or a (line1, line2)
+    tuple (all-projects mode).  The two-line form keeps the title on line 1
+    full-width, with the cwd displayed under it via a ↳ continuation marker
+    — avoids the `[cwd] id ts msgs title…` pileup that clipped titles at 80 cols.
+    """
+    head = f"{s.short_id}  {fmt_ts(s.last)}  {s.turns:>3} msgs  {s.headline}"
+    if with_project and s.cwd:
+        home = str(Path.home())
+        cwd = s.cwd.replace(home, "~", 1) if s.cwd.startswith(home) else s.cwd
+        return (truncate(head, width), truncate(f"    ↳ {cwd}", width))
+    return truncate(head, width)
+
+# ---------- curses menu widget ----------
+
+def _menu_impl(stdscr, title: str, subtitle: str, items: list[tuple], default_idx: int):
+    """Arrow-key scrollable single-select. Returns the selected value or None."""
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    # Drop any keystrokes buffered while a prior menu / subprocess was running,
+    # so a fast Esc at the previous level can't cascade into this one.
+    curses.flushinp()
+    try:
+        curses.set_escdelay(25)  # Python 3.9+; harmless if ESCDELAY env is already set
+    except (AttributeError, curses.error):
+        pass
+    try:
+        curses.use_default_colors()
+    except curses.error:
+        pass
+    try:
+        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)  # selected
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)                # title
+        curses.init_pair(3, curses.COLOR_WHITE, -1)                 # subtitle
+    except curses.error:
+        pass
+
+    idx = max(0, min(default_idx, len(items) - 1))
+    top = 0
+
+    subtitle_lines = subtitle.split("\n") if subtitle else []
+
+    # Normalize labels to a list of display lines.  One-line items stay as
+    # one line; two-line items (e.g. all-projects picker rows) take two.
+    def item_lines(label):
+        return list(label) if isinstance(label, tuple) else [label]
+
+    def label_text(label):
+        return label if isinstance(label, str) else " ".join(label)
+
+    # Filter state.  `/` opens filter mode; typed chars narrow the visible
+    # list (case-insensitive substring over the full label text); Esc in
+    # filter mode clears + exits; Enter picks the currently-highlighted
+    # filtered row; Backspace edits the query instead of being "back".
+    filter_mode = False
+    filter_query = ""
+
+    # Digit-jump state.  Typing 1–9 (or 0 → 10) jumps to that row; typing
+    # two digits within DIGIT_TIMEOUT_MS combines them (e.g. 2,5 → 25).
+    digit_buffer = ""
+    import time as _time
+    digit_last_ms = 0.0
+    DIGIT_TIMEOUT_MS = 500
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+
+        # Compute visible (filtered) items.
+        if filter_query:
+            q = filter_query.lower()
+            vis = [it for it in items if q in label_text(it[1]).lower()]
+        else:
+            vis = items
+        if not vis:
+            idx = 0
+        else:
+            idx = max(0, min(idx, len(vis) - 1))
+        if top > idx:
+            top = idx
+
+        # Layout: title line, N subtitle lines, blank spacer, list, blank, footer.
+        header_lines = 1 + len(subtitle_lines) + 1
+        footer_lines = 2
+        list_h = max(1, h - header_lines - footer_lines)
+
+        try:
+            stdscr.addnstr(0, 0, title, w - 1, curses.color_pair(2) | curses.A_BOLD)
+            for i, sline in enumerate(subtitle_lines):
+                stdscr.addnstr(1 + i, 0, sline, w - 1, curses.color_pair(3))
+        except curses.error:
+            pass
+
+        # Scroll: adjust `top` so current item fits.  Each item is height 1 or 2.
+        if vis:
+            if idx < top:
+                top = idx
+            else:
+                while top < idx:
+                    vrows = sum(len(item_lines(vis[j][1])) for j in range(top, idx + 1))
+                    if vrows <= list_h:
+                        break
+                    top += 1
+
+        y = header_lines
+        if vis:
+            for i in range(top, len(vis)):
+                lines = item_lines(vis[i][1])
+                if y + len(lines) > header_lines + list_h:
+                    break
+                selected = (i == idx)
+                for li, label_line in enumerate(lines):
+                    if selected and li == 0:
+                        attr = curses.color_pair(1)
+                    elif li > 0:
+                        attr = curses.A_DIM
+                    else:
+                        attr = curses.A_NORMAL
+                    line = f" {label_line} ".ljust(w - 1)
+                    try:
+                        stdscr.addnstr(y, 0, line, w - 1, attr)
+                    except curses.error:
+                        pass
+                    y += 1
+        elif filter_query:
+            try:
+                stdscr.addnstr(header_lines, 0,
+                               f"  (no matches for '{filter_query}')",
+                               w - 1, curses.A_DIM)
+            except curses.error:
+                pass
+
+        # Footer — swaps out when filter mode is on.
+        if filter_mode:
+            footer = f"filter: {filter_query}_   (Esc clears, Enter picks, ⌫ edits)"
+        else:
+            footer = "↑/↓ move   Enter select   / filter   Esc / q / ⌫ back"
+            if len(vis) and len(vis) > list_h:
+                footer += f"   [{idx + 1}/{len(vis)}]"
+            elif filter_query:
+                footer += f"   [filtered: {len(vis)}/{len(items)}]"
+        try:
+            stdscr.addnstr(h - 1, 0, footer[: w - 1], w - 1, curses.A_DIM)
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+
+        # --- filter mode: intercept most keys ---
+        if filter_mode:
+            if ch == 27:  # Esc → clear filter, exit mode
+                filter_mode = False
+                filter_query = ""
+                idx = 0
+                top = 0
+            elif ch in (8, 127, curses.KEY_BACKSPACE, curses.KEY_DC):
+                filter_query = filter_query[:-1]
+                idx = 0
+                top = 0
+            elif ch in (10, 13, curses.KEY_ENTER):
+                if vis:
+                    return vis[idx][0]
+            elif ch in (curses.KEY_UP, curses.KEY_DOWN,
+                        curses.KEY_PPAGE, curses.KEY_NPAGE,
+                        curses.KEY_HOME, curses.KEY_END):
+                # navigation allowed; fall through to common handler below
+                pass
+            elif 32 <= ch < 127:  # printable ASCII → extend query
+                filter_query += chr(ch)
+                idx = 0
+                top = 0
+                continue
+            else:
+                continue
+
+        # --- common navigation + non-filter commands ---
+        if ch in (curses.KEY_UP,) or (not filter_mode and ch == ord("k")):
+            if vis:
+                idx = (idx - 1) % len(vis)
+        elif ch in (curses.KEY_DOWN,) or (not filter_mode and ch == ord("j")):
+            if vis:
+                idx = (idx + 1) % len(vis)
+        elif ch == curses.KEY_PPAGE:
+            if vis:
+                idx = max(0, idx - list_h)
+        elif ch == curses.KEY_NPAGE:
+            if vis:
+                idx = min(len(vis) - 1, idx + list_h)
+        elif ch == curses.KEY_HOME:
+            idx = 0
+        elif ch == curses.KEY_END:
+            if vis:
+                idx = len(vis) - 1
+        elif ch in (10, 13, curses.KEY_ENTER):
+            if vis:
+                return vis[idx][0]
+        elif not filter_mode and ch == ord("/"):
+            filter_mode = True
+            filter_query = ""
+        elif not filter_mode and ord("0") <= ch <= ord("9") and vis:
+            # Digit-jump: `1`..`9` → 1-based row, `0` → 10. Two-digit combos
+            # within DIGIT_TIMEOUT_MS concatenate (e.g. 2,5 → 25).
+            now_ms = _time.time() * 1000.0
+            if now_ms - digit_last_ms > DIGIT_TIMEOUT_MS:
+                digit_buffer = ""
+            digit_buffer += chr(ch)
+            digit_last_ms = now_ms
+            n = int(digit_buffer)
+            # In the 1–9 single-digit case, '0' means 10. Once a second digit
+            # is typed, treat as literal decimal.
+            if digit_buffer == "0":
+                n = 10
+            target = min(len(vis), max(1, n)) - 1
+            idx = target
+        # 27=Esc  q=quit-like  8/127/KEY_BACKSPACE/KEY_DC=Backspace or Delete.
+        # (In filter mode these edit the query; handled above.)
+        elif not filter_mode and ch in (27, ord("q"), 8, 127,
+                                        curses.KEY_BACKSPACE, curses.KEY_DC):
+            return None
+        # Ctrl-C is handled by KeyboardInterrupt in main().
+
+def menu(title: str, subtitle: str, items: list[tuple], default=None):
+    if not items:
+        return None
+    values = [v for v, _ in items]
+    default_idx = values.index(default) if default in values else 0
+    return curses.wrapper(_menu_impl, title, subtitle, items, default_idx)
+
+# ---------- output rendering (outside curses, uses scrollback) ----------
+
+def wait_any_key(prompt: str) -> None:
+    """Block on a single keystroke — Enter, Esc, space, anything.
+
+    Uses cbreak + echo-off so mashed Esc presses don't splatter '^[^[^[' onto
+    the prompt (which is what cooked-mode input() does). Also drains any
+    trailing bytes from an arrow-key escape sequence or a burst of Escs, so
+    they don't leak into the shell or the next curses session.
+    """
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    try:
+        import termios, tty, select  # POSIX-only; Windows falls through to input()
+    except ImportError:
+        try: input()
+        except EOFError: pass
+        return
+    fd = sys.stdin.fileno()
+    try:
+        old = termios.tcgetattr(fd)
+    except termios.error:
+        try: input()
+        except EOFError: pass
+        return
+    try:
+        tty.setcbreak(fd)
+        attrs = termios.tcgetattr(fd)
+        attrs[3] &= ~termios.ECHO
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        # Drain typeahead buffered while curses was up / subprocess was
+        # running, so a stray \n or \x1b doesn't count as the user's press.
+        # os.read bypasses sys.stdin's 8 KB buffer that otherwise holds the
+        # tail of an escape sequence past what select() can see.
+        while select.select([fd], [], [], 0)[0]:
+            os.read(fd, 1)
+        os.read(fd, 1)
+        while select.select([fd], [], [], 0)[0]:
+            os.read(fd, 1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+def _banner_frame(title: str, text: str) -> str:
+    """Return the framed (banner + content + footer bar) string, WITHOUT the
+    leading screen-clear.  Used for both live rendering and when piping to
+    `less` (which manages its own alt-screen)."""
+    try:
+        width = os.get_terminal_size().columns
+    except OSError:
+        width = 80
+    width = max(40, min(width, 120))
+    bar = "═" * width
+    return (f"\n\x1b[36m{bar}\n  {title}\n{bar}\x1b[0m\n"
+            + strip_ansi(text)
+            + f"\n\x1b[36m{bar}\x1b[0m\n")
+
+def _paint(title: str, text: str) -> None:
+    sys.stdout.write("\x1b[2J\x1b[H")
+    sys.stdout.write(_banner_frame(title, text))
+    sys.stdout.flush()
+
+def _should_page(text: str) -> bool:
+    """Pager kicks in when `auto` (default) AND output exceeds the viewport."""
+    mode = os.environ.get("CCT_PAGER", "auto").lower()
+    if mode == "never":
+        return False
+    if mode not in ("auto", "always"):
+        return False
+    if not sys.stdout.isatty():
+        return False
+    try:
+        import shutil
+        if not shutil.which("less"):
+            return False
+    except Exception:
+        return False
+    try:
+        rows = os.get_terminal_size().lines
+    except OSError:
+        rows = 24
+    return mode == "always" or len(text.splitlines()) > max(8, rows - 6)
+
+def render_output(title: str, text: str) -> None:
+    """Render `text` under a banner.  Short output scrolls into the terminal's
+    scrollback; long output (more than the viewport) is piped through `less -R`
+    unless CCT_PAGER=never.  Content is ANSI-stripped either way so transcript
+    bytes can't manipulate the user's terminal."""
+    if _should_page(text):
+        try:
+            subprocess.run(
+                ["less", "-R", "-X"],  # -X keeps the banner visible after exit
+                input=_banner_frame(title, text),
+                text=True,
+            )
+        except Exception:
+            _paint(title, text)
+        wait_any_key("[any key] back  ")
+        return
+    _paint(title, text)
+    wait_any_key("[any key] back  ")
+
+def _read_one_key() -> str:
+    """Read a single keystroke in cbreak+noecho mode. Returns the char or ''."""
+    try:
+        import termios, tty, select
+    except ImportError:
+        try: return input()[:1]
+        except EOFError: return ""
+    fd = sys.stdin.fileno()
+    try:
+        old = termios.tcgetattr(fd)
+    except termios.error:
+        try: return input()[:1]
+        except EOFError: return ""
+    try:
+        tty.setcbreak(fd)
+        attrs = termios.tcgetattr(fd)
+        attrs[3] &= ~termios.ECHO
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        # Drain typeahead — bytes queued while curses was up or while the
+        # subprocess fetch_fn was running (e.g. a trailing Enter, or an
+        # orphan \x1b from an arrow-key escape sequence). Without this,
+        # a stale byte is read as the user's "keypress" and the refresh
+        # prompt returns instantly without the user touching anything.
+        # Use os.read on the raw fd — sys.stdin's TextIOWrapper has an 8 KB
+        # buffer that can swallow trailing bytes of an escape sequence and
+        # hide them from select(), causing phantom-exits on the next call.
+        while select.select([fd], [], [], 0)[0]:
+            os.read(fd, 1)
+        b = os.read(fd, 1)
+        ch = b.decode("utf-8", errors="replace") if b else ""
+        # Collect the rest of any escape sequence the user did just press
+        # (so tails don't leak into the shell or next curses session). If it
+        # turns out to be an arrow key, return a symbolic name so callers can
+        # offer ←/→ navigation; a bare Esc still comes back as "\x1b".
+        # After an ESC byte, wait briefly for the tail — over a local PTY the
+        # whole sequence arrives within a millisecond.
+        seq = b""
+        timeout = 0.05 if ch == "\x1b" else 0
+        while select.select([fd], [], [], timeout)[0]:
+            seq += os.read(fd, 1)
+            timeout = 0
+        if ch == "\x1b" and seq:
+            arrows = {b"[A": "UP", b"[B": "DOWN", b"[C": "RIGHT", b"[D": "LEFT"}
+            return arrows.get(seq, "")
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+def render_output_refresh(title_for, fetch_for, *, variants: int = 1,
+                          variant_names: tuple[str, ...] | None = None) -> None:
+    """Refreshable in-place output view.
+
+    title_for(v)     → banner title for variant v (0-indexed).
+    fetch_for(v)     → text to paint for variant v.
+    variants         → how many variants exist. 1 = no toggle (most screens);
+                       2+ = footer shows the variant hint and key v cycles.
+    variant_names    → short names, one per variant, used in the footer hint
+                       ("[v] show <next>"). If omitted, falls back to the
+                       generic "[v] toggle view".
+
+    Enter / Space / r / R → re-run fetch_for(current variant).
+    v / V                 → advance variant (only if variants > 1).
+    p / P                 → page the currently-displayed text through `less -R`
+                            (no re-fetch). Useful when output overflows the
+                            terminal and you want to scroll back within the view
+                            rather than through shell scrollback.
+    anything else         → return to caller (Esc / q / ⌫ / unrecognized key).
+    """
+    variant = 0
+    while True:
+        title = title_for(variant)
+        # Cache the fetched text so `p` (page) can re-use it without re-running
+        # a potentially slow subprocess (status/cost/stack all shell-out).
+        text = fetch_for(variant)
+        _paint(title, text)
+        parts = ["[Enter] refresh"]
+        if variants > 1:
+            if variant_names and len(variant_names) == variants:
+                nxt = variant_names[(variant + 1) % variants]
+                parts.append(f"[v] show {nxt}")
+            else:
+                parts.append("[v] toggle view")
+        parts.append("[p] page")
+        parts.append("[Esc] back")
+        sys.stdout.write(" · ".join(parts) + "  ")
+        sys.stdout.flush()
+        ch = _read_one_key()
+        sys.stdout.write("\n")
+        # Enter, Space, 'r', or 'R' → refresh. Others (q, Esc=\x1b, etc) → back.
+        if ch in ("\n", "\r", " ", "r", "R"):
+            continue
+        if variants > 1 and ch in ("v", "V"):
+            variant = (variant + 1) % variants
+            continue
+        if ch in ("p", "P"):
+            # Page the current text. After less exits, loop continues and
+            # _paint() re-draws above so we're back in the refresh UI.
+            try:
+                subprocess.run(
+                    ["less", "-R", "-X"],
+                    input=_banner_frame(title, text),
+                    text=True,
+                )
+            except Exception:
+                pass  # fall through; user can press p again or Esc out
+            continue
+        return
+
+# ---------- menus ----------
+
+ENTRY_ITEMS = [
+    ("status",   "Status (at-a-glance dashboard)"),
+    ("current",  "Sessions in current project"),
+    ("all",      "Sessions in all projects"),
+    ("active",   "Active sessions (currently running system-wide)"),
+    ("cost",     "Cost report (today / week / 30 days)"),
+    ("monthly",  "Usage & cost by month  →"),
+    ("projects", "Cost by project (with daily breakdown)  →"),
+    ("stack",    "Stack / tech used (today / week / 30 days)"),
+    ("trouble",  "Troubleshooting / cleanup  →"),
+]
+
+TROUBLE_ITEMS = [
+    ("stale",    "Stale session markers (leftover PID files)"),
+    ("dead",     "Dead projects (folder gone)"),
+    ("dead_v",   "Dead projects (verbose — list sessions)"),
+    ("back",     "Back"),
+]
+
+ACTION_ITEMS = [
+    ("stats",      "Stats + cost"),
+    ("tools",      "Tool usage"),
+    ("questions",  "Your prompts (questions)"),
+    ("back",       "Back to session picker"),
+]
+
+def entry_menu(default: str | None):
+    subtitle = (
+        "Browse and inspect your Claude Code session transcripts stored under "
+        "~/.claude/projects/.\n"
+        "Pick a project → pick a session → see token cost, tool usage, or bash "
+        "command history.\n"
+        "\n"
+        "What would you like to do?"
+    )
+    return menu("cct", subtitle, ENTRY_ITEMS, default=default or "current")
+
+def session_picker(sessions: list[Session], title: str, with_project: bool):
+    if not sessions:
+        render_output("No sessions", f"No sessions for {title}.\n")
+        return None
+    # Build rows using a reasonable width; curses will further clip on narrow terminals.
+    try:
+        width = os.get_terminal_size().columns - 2
+    except OSError:
+        width = 120
+    items = [(s, session_row(s, with_project=with_project, width=width)) for s in sessions]
+    return menu(title, f"{len(sessions)} session(s) — Enter picks, Esc goes back", items)
+
+def action_menu(s: Session):
+    subtitle = f"{s.short_id}  {fmt_ts(s.first)} → {fmt_ts(s.last)}  |  {s.title or s.headline}"
+    return menu("Session actions", truncate(subtitle, 200), ACTION_ITEMS, default="stats")
+
+# ---------- flows ----------
+
+def troubleshooting_flow():
+    """Submenu for cleanup / diagnostics — things you rarely need."""
+    while True:
+        action = menu(
+            "cct · Troubleshooting / cleanup",
+            "Uncommon tools for spotting leftover state.\nEsc / q / ⌫ / Back to return.",
+            TROUBLE_ITEMS,
+            default="stale",
+        )
+        if action is None or action == "back":
+            return
+        if action == "stale":
+            render_output_refresh(
+                lambda v: "Stale session markers",
+                lambda v: run_script("active-sessions.sh", "--stale-only"),
+            )
+        elif action == "dead":
+            render_output("Dead projects", run_script("dead-sessions.sh"))
+        elif action == "dead_v":
+            render_output("Dead projects (verbose)", run_script("dead-sessions.sh", "-v"))
+
+_MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July",
+                "August", "September", "October", "November", "December")
+
+def _month_label(ym: str) -> str:
+    """'2026-08' → '2026-08  (August 2026)'."""
+    try:
+        y, m = ym.split("-")
+        return f"{ym}  ({_MONTH_NAMES[int(m) - 1]} {y})"
+    except (ValueError, IndexError):
+        return ym
+
+def month_detail_view(months: list[str], i: int) -> None:
+    """Single-month detail with ←/→ (or [ / ]) navigation between months.
+
+    `months` is sorted newest-first, so → moves to a newer month (index down)
+    and ← to an older one (index up) — matching the intuitive timeline
+    direction of the arrow keys.
+    """
+    while True:
+        m = months[i]
+        title = f"Usage & cost · {_month_label(m)}"
+        text = run_script("cost-report.sh", "--month", m)
+        _paint(title, text)
+        parts = ["[Enter] refresh"]
+        if i + 1 < len(months):
+            parts.append("[←] older")
+        if i > 0:
+            parts.append("[→] newer")
+        parts.append("[p] page")
+        parts.append("[Esc] back")
+        sys.stdout.write(" · ".join(parts) + "  ")
+        sys.stdout.flush()
+        ch = _read_one_key()
+        sys.stdout.write("\n")
+        if ch in ("\n", "\r", " ", "r", "R"):
+            continue
+        if ch in ("LEFT", "[", ",") and i + 1 < len(months):
+            i += 1
+            continue
+        if ch in ("RIGHT", "]", ".") and i > 0:
+            i -= 1
+            continue
+        if ch in ("p", "P"):
+            try:
+                subprocess.run(
+                    ["less", "-R", "-X"],
+                    input=_banner_frame(title, text),
+                    text=True,
+                )
+            except Exception:
+                pass
+            continue
+        return
+
+def monthly_flow() -> None:
+    """Per-calendar-month usage & cost: summary table + navigable month detail."""
+    summary = run_script("cost-report.sh", "--months")
+    months = re.findall(r"^(\d{4}-\d{2})\b", summary, re.M)  # newest first
+    items: list[tuple] = [("summary", "All months — summary table")]
+    items += [(m, _month_label(m)) for m in months]
+    while True:
+        choice = menu(
+            "cct · Usage & cost by month",
+            f"{len(months)} month(s) with recorded usage.\n"
+            "Pick a month for detail (←/→ steps between months once inside), "
+            "or the summary table.",
+            items,
+            default="summary",
+        )
+        if choice is None:
+            return
+        if choice == "summary":
+            render_output_refresh(
+                lambda v: "Usage & cost by month" + (" (extended)" if v else ""),
+                lambda v: run_script("cost-report.sh", "--months", *(["-v"] if v else [])),
+                variants=2,
+                variant_names=("summary", "extended"),
+            )
+        else:
+            month_detail_view(months, months.index(choice))
+
+def projects_flow() -> None:
+    """Per-project cost breakdown, drilling into one project's daily trend."""
+    # `--list` prints full cwd paths, cost-sorted, one per line — a stable
+    # contract, unlike scraping the human table whose columns are clipped.
+    listing = run_script("project-costs.sh", "--list")
+    home = str(Path.home())
+    projects = [ln for ln in listing.splitlines() if ln.startswith("/")]
+    if not projects:
+        render_output("Cost by project", run_script("project-costs.sh"))
+        return
+
+    def label(p: str) -> str:
+        return "~" + p[len(home):] if p.startswith(home + "/") else p
+
+    items: list[tuple] = [("summary", "All projects — summary table")]
+    items += [(p, label(p)) for p in projects]
+    while True:
+        choice = menu(
+            "cct · Cost by project",
+            f"{len(projects)} project(s).\n"
+            "Pick a project to see daily cost breakdown, or the summary table.",
+            items,
+            default="summary",
+        )
+        if choice is None:
+            return
+        if choice == "summary":
+            render_output_refresh(
+                lambda v: "Cost by project" + (" (extended)" if v else ""),
+                lambda v: run_script("project-costs.sh", *(["-v"] if v else [])),
+                variants=2,
+                variant_names=("summary", "extended"),
+            )
+        else:
+            render_output_refresh(
+                lambda v, p=label(choice): f"Daily cost — {p}" + (" (extended)" if v else ""),
+                lambda v, proj=choice: run_script(
+                    "project-costs.sh", "--dates", proj, *(["-v"] if v else [])
+                ),
+                variants=2,
+                variant_names=("summary", "extended"),
+            )
+
+def do_session_flow(sessions: list[Session], title: str, with_project: bool):
+    while True:
+        picked = session_picker(sessions, title, with_project)
+        if picked is None:
+            return
+        label = f"{picked.short_id} · {picked.title or picked.headline}"
+        while True:
+            action = action_menu(picked)
+            if action is None or action == "back":
+                break
+            if action == "stats":
+                render_output(f"Stats + cost · {label}",
+                              run_script("session-stats.sh", picked.id))
+            elif action == "tools":
+                render_output_refresh(
+                    lambda v, lbl=label: f"Tool usage{' + bash commands' if v else ''} · {lbl}",
+                    lambda v, sid=picked.id: run_script(
+                        "session-tools.sh", sid, *(["--commands"] if v else [])
+                    ),
+                    variants=2,
+                    variant_names=("summary", "with bash commands"),
+                )
+            elif action == "questions":
+                render_output(f"Your prompts · {label}",
+                              run_script("session-questions.sh", picked.id))
+
+CCT_VERSION = "0.4.0"
+
+HELP_TEXT = """\
+cct — interactive TUI for Claude Code session transcripts.
+
+Usage:
+  cct             Launch the interactive menu (default).
+  cct -h, --help  Show this help and exit.
+  cct --version   Print version and exit.
+
+Environment:
+  CCT_PAGER       auto (default) | never   Control whether long outputs are
+                  paged through `less -R`.
+
+Inside the TUI:
+  ↑/↓ or j/k       Move cursor.
+  PgUp / PgDn      Page through a long list.
+  Home / End       First / last item.
+  1–9              Jump to absolute row number (picker only).
+  /                Filter the current list (picker only).
+  Enter            Select / refresh a live view.
+  v                Toggle short ↔ extended on views that have both
+                   (cost / stack / tool usage).
+  ←/→ or [/]       Older / newer month in the by-month detail view.
+  p                Page the current view through `less -R` (scroll back
+                   within the view when output overflows the terminal).
+  Esc, q, ⌫        Back one level.
+  Ctrl-C           Quit from anywhere.
+
+Shell scripts invoked under the hood live next to this file and can be
+used standalone: list-sessions.sh, session-stats.sh, session-tools.sh,
+session-questions.sh, active-sessions.sh, cost-report.sh, project-costs.sh,
+stack-report.sh, dead-sessions.sh, status.sh.
+"""
+
+def main() -> int:
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if arg in ("-h", "--help"):
+            sys.stdout.write(HELP_TEXT)
+            return 0
+        if arg in ("--version", "-V"):
+            sys.stdout.write(f"cct {CCT_VERSION}\n")
+            return 0
+        sys.stderr.write(f"cct: unknown argument {arg!r}.  Try `cct --help`.\n")
+        return 2
+    state = load_state()
+    last = state.get("last_action")
+    try:
+        while True:
+            action = entry_menu(default=last)
+            if action is None:
+                return 0
+            last = action
+            state["last_action"] = last
+            save_state(state)
+
+            if action == "current":
+                cwd = Path(os.getcwd())
+                sessions = sessions_in(PROJECTS_ROOT / slug_for(cwd))
+                if not sessions:
+                    # Empty state: offer a one-keystroke fall-through to the
+                    # all-projects picker so the user isn't dumped back to
+                    # the entry menu with no guidance.
+                    _paint(
+                        "No sessions",
+                        f"No Claude Code history for this project:\n  {cwd}\n\n"
+                        "Press any key to browse sessions across ALL projects,\n"
+                        "or Esc / q to go back to the menu.\n",
+                    )
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    ch = _read_one_key()
+                    sys.stdout.write("\n")
+                    if ch in ("\x1b", "q", "Q"):
+                        continue
+                    do_session_flow(all_sessions(), title="all projects", with_project=True)
+                else:
+                    do_session_flow(sessions, title=str(cwd), with_project=False)
+            elif action == "all":
+                do_session_flow(all_sessions(), title="all projects", with_project=True)
+            elif action == "status":
+                render_output_refresh(
+                    lambda v: "Status",
+                    lambda v: run_script("status.sh"),
+                )
+            elif action == "active":
+                render_output_refresh(
+                    lambda v: "Active sessions",
+                    lambda v: run_script("active-sessions.sh"),
+                )
+            elif action == "cost":
+                render_output_refresh(
+                    lambda v: "Cost report" + (" (extended)" if v else ""),
+                    lambda v: run_script("cost-report.sh", *(["-v"] if v else [])),
+                    variants=2,
+                    variant_names=("summary", "extended"),
+                )
+            elif action == "monthly":
+                monthly_flow()
+            elif action == "projects":
+                projects_flow()
+            elif action == "stack":
+                render_output_refresh(
+                    lambda v: "Stack / tech used" + (" (extended)" if v else ""),
+                    lambda v: run_script("stack-report.sh", *(["-v"] if v else [])),
+                    variants=2,
+                    variant_names=("summary", "extended"),
+                )
+            elif action == "trouble":
+                troubleshooting_flow()
+    except KeyboardInterrupt:
+        return 130
+
+if __name__ == "__main__":
+    sys.exit(main())
