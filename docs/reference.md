@@ -57,6 +57,26 @@ Since it's append-only JSONL, any `jq` / `awk` pipeline works against it.
 
 ## Scripts
 
+All scripts require `jq` and read only from `~/.claude/` — nothing is written or deleted.
+
+### `status.sh`
+
+One-screen overview, rolled up from the other scripts: active sessions (count + per-project), token cost for today / this week / last 30 days, and cleanup signals (dead projects, stale session markers). No options.
+
+```bash
+./status.sh
+```
+
+### `active-sessions.sh`
+
+Lists the Claude Code sessions running *right now*. Each live `claude` process drops a marker at `~/.claude/sessions/<PID>.json`; the script keeps the markers whose PID is still alive and joins them against the transcript to show project, session id, title and recent activity.
+
+```bash
+./active-sessions.sh              # one row per live session
+./active-sessions.sh -v           # also list stale markers (process gone)
+./active-sessions.sh --stale-only # only the stale section (or an OK banner)
+```
+
 ### `list-sessions.sh`
 
 Lists Claude Code sessions for a project directory, newest first. Each row shows session id, first→last timestamp, event count, Claude's auto-generated `ai-title`, and the first/last real user prompts (taken from `last-prompt` events — the snapshot mechanism Claude Code uses to remember the typed user input, so this skips slash-command wrappers and system noise).
@@ -237,6 +257,8 @@ summary: 2 dead, 0 unknown
 
 Aggregates estimated token cost across every transcript, using the same pricing table as `session-stats.sh` (see [Cost model](#cost-model)).
 
+![Cost report, extended](images/cost-report-extended.png)
+
 ```bash
 ./cost-report.sh                 # rolling windows: today / yesterday / week / 30 days
 ./cost-report.sh -v              # …with per-model breakdown
@@ -250,6 +272,12 @@ In the TUI, **Usage & cost by month** shows the `--months` summary and a per-mon
 ### `project-costs.sh`
 
 Aggregates estimated token cost by project, with an optional per-day breakdown for a single project.
+
+![Cost by project](images/cost-by-project.png)
+
+`--dates <project>` with `-v` gives the daily trend split per model — the view the TUI reaches via **Cost by project** → pick a project → `v`:
+
+![Daily cost per project, per model](images/project-daily-extended.png)
 
 ```bash
 ./project-costs.sh                          # total cost per project, sorted desc
