@@ -8,9 +8,27 @@ but gives you no way to list or inspect them outside its own resume picker.
 `cct` is an arrow-key terminal UI over those transcripts — no UUIDs, no paths to
 type. It reads only; it never modifies or deletes your Claude Code state.
 
-![The cct main menu](docs/images/menu.png)
+![Status: sessions running right now, and what today, this week and the last 30
+days cost](docs/images/status.png)
 
-*(Project names, paths and session titles are blurred in all screenshots.)*
+*What's running right now, what it has cost you today and this month, what is
+left to clean up.*
+
+![Time by project: Claude working, tools running, background agents, waiting on
+you, and you reading and typing](docs/images/time-by-project.png)
+
+*And where the hours went — per project, split into Claude generating, tools
+running, background agents, waiting on you, and you reading and typing. Project
+names, paths, session ids and titles, and prompt text are blurred in all
+screenshots.*
+
+This page is the tour. **[docs/reference.md](docs/reference.md)** is the manual:
+every script with its options and example output, how long Claude Code keeps the
+transcripts everything here is built on
+([`cleanupPeriodDays`](docs/reference.md#how-long-transcripts-live-cleanupperioddays)),
+[how the cost estimate is computed](docs/reference.md#cost-model),
+[what the time buckets mean](docs/reference.md#time-reportpy), and the shape of
+the transcript format itself.
 
 > **Heads-up.** cct is a homegrown tool, written for personal use and shared
 > as is. It may contain bugs — including in the numbers. Costs in particular
@@ -50,6 +68,8 @@ cct       # from any directory
 
 You get a menu:
 
+![The cct main menu](docs/images/menu.png)
+
 | Entry | What you see |
 | --- | --- |
 | **Status** | At-a-glance dashboard: live sessions, today/week/30-day cost, cleanup hints |
@@ -65,10 +85,8 @@ You get a menu:
 | **Stack / tech used** | Languages and ecosystems you worked on, by time window |
 | **Troubleshooting / cleanup** | Dead project folders, stale session markers |
 
-**Status** answers "what's going on right now?" — what's running, what today
-and this month cost, what needs cleaning up:
-
-![Status dashboard](docs/images/status.png)
+**Status** is the dashboard at the top of this page — what's running, what today
+and this month cost, what needs cleaning up.
 
 The session picker lists every session with its date, message count, title and
 project:
@@ -110,6 +128,8 @@ subfolders, and the merged project gets its own cost, session list, time
 analytics and export, all counted together. The plain per-folder views stay as
 they were; bindings live in `~/.config/cct/merges.json`.
 
+![Cost of a merged project, folder by folder](docs/images/merged-projects.png)
+
 ### Where the time goes
 
 **Time analytics** turns the event timestamps of every session into five
@@ -123,6 +143,12 @@ You get it per project, per day, per session, and per turn inside one session
 calendar days. What you do on the project without talking to Claude is
 invisible to the transcript, so it shows up as a break.
 
+Per project that is the table at the top of this page. One session up close —
+the same buckets as bars, what the background agents ran and cost, and (`v`)
+one row per turn:
+
+![Time breakdown for one session](docs/images/time-session.png)
+
 ### Export your prompts
 
 **Export prompts** writes what you typed. By default that is one text file per
@@ -135,6 +161,8 @@ on top. Files go to `~/cct-export/<project>/` unless you type another folder;
 nothing is ever overwritten — if a file is already there, the export stops
 and tells you.
 
+![Export prompts](docs/images/export-prompts.png)
+
 Keys: ↑/↓ or `j`/`k`, PgUp/PgDn, Home/End, Enter selects, Esc or `q` goes back,
 `v` toggles the extended view where offered, Ctrl-C quits.
 
@@ -143,6 +171,23 @@ billing may differ. Background agents and workflows are priced from their own
 transcripts, so a session that fans out work costs what it really cost. The
 price table is one file, `pricing.json` — edit it there when prices change and
 every view picks it up.
+
+### How far back it can see
+
+Only as far as Claude Code keeps its transcripts. It deletes them after
+`cleanupPeriodDays` — **30 days by default** — so earlier months quietly empty
+out: the monthly view ends about a month back, and a project you haven't opened
+since then disappears from the reports entirely. Keep more history with
+
+```json
+{ "cleanupPeriodDays": 365 }
+```
+
+in `~/.claude/settings.json`. It costs no tokens — the setting only decides
+which files stay on your disk, and nothing is sent anywhere — but it does cost
+disk space, makes the reports slower to scan, and leaves more of your prompts
+lying around in plaintext. Details in
+[docs/reference.md](docs/reference.md#how-long-transcripts-live-cleanupperioddays).
 
 ## Scripts on their own
 
@@ -153,5 +198,5 @@ The TUI just drives a set of standalone scripts — `status.sh`,
 `time-report.py` and `export-prompts.py` (stdlib only). Run any of them
 directly if you'd rather script or pipe the output.
 
-Full options, example output, the pricing table and notes on the transcript
-format are in [docs/reference.md](docs/reference.md).
+Full options and example output for each of them are in
+[docs/reference.md](docs/reference.md#scripts).

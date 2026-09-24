@@ -27,6 +27,34 @@ Claude Code writes everything under `~/.claude/`. Relevant paths:
 | `~/.claude/plans/`                       | Saved plans from Plan mode.                                                                                                               |
 | `~/.claude/settings.json`                | User settings (hooks, permissions, env).                                                                                                  |
 
+### How long transcripts live: `cleanupPeriodDays`
+
+Claude Code deletes its own history. On startup it sweeps everything older than `cleanupPeriodDays` — **30 days by default** — so the transcripts cct reads are a rolling window, not an archive. Minimum is `1`; `0` is rejected as invalid ([settings reference](https://code.claude.com/docs/en/settings-reference), [.claude directory](https://code.claude.com/docs/en/claude-directory#cleaned-up-automatically)).
+
+That is what makes whole earlier months go missing from these reports. With the default window:
+
+- **Usage & cost by month** stops roughly a month back — last month is already half-eaten, the month before it is empty.
+- A project you haven't opened in over 30 days vanishes from **Cost by project**, **Time analytics** and the session pickers: its transcripts are gone, and if the folder is gone too the slug shows up under *dead projects*.
+- Totals for an old month keep shrinking every day, because the sweep eats into them from behind.
+
+The sweep also takes the session's `subagents/` and `tool-results/` folders, `file-history/`, `plans/`, `debug/`, `shell-snapshots/`, `paste-cache/`, `uploads/`, `backups/` and `usage-data/`. It does *not* touch auto memory, `history.jsonl`, `stats-cache.json` or your credentials. Transcripts of sessions started or last continued in Claude Desktop or Cowork are exempt unless `desktopSessionCleanupPeriodDays` is set.
+
+To keep more history, raise it in `~/.claude/settings.json`:
+
+```json
+{ "cleanupPeriodDays": 365 }
+```
+
+**Does a bigger window cost tokens?** No. The sweep is a local file deletion and nothing more: how many old transcripts sit on disk never enters a prompt and is never uploaded. What a session sends to the model is its *own* history, and only when you resume it (`--continue` / `--resume`) — a year of other sessions on disk changes neither the context nor the bill. cct itself only reads files.
+
+What it does cost:
+
+- **Disk.** Transcripts are plaintext JSON and a busy month runs to hundreds of MB. `du -sh ~/.claude/projects` before and after is the honest check.
+- **Speed.** Every report here walks every transcript, and Claude Code's own `/resume` picker gets longer. A year of history makes the all-projects views noticeably slower.
+- **Privacy.** More of your prompts stay on disk in plaintext, for longer. That is the real trade-off, not tokens.
+
+If you want history beyond the window without keeping the transcripts, export the prompts ([`export-prompts.py`](#export-promptspy)) — exported files live outside `~/.claude/` and the sweep never touches them.
+
 ### The project slug
 
 The `<slug>` folder name is derived from the absolute project path by replacing **both `/` and `_`** with `-`. Example:
@@ -349,9 +377,15 @@ Bindings live in `~/.config/cct/merges.json` (`$XDG_CONFIG_HOME` is honoured):
 
 `<name>` matches a merged project exactly, or by a unique case-insensitive substring.
 
+**Merged projects → All merged projects — cost summary**, with `v` for the member folders (`project-costs.sh --merged -v`) — the folder that is gone still carries its share:
+
+![Cost by merged project, per folder](images/merged-projects.png)
+
 ### `time-report.py`
 
 Where the hours went. Only timestamped `user`/`assistant` events on the main thread count; every gap between two consecutive ones is attributed to whoever was busy during it, decided by the event that *ends* the gap:
+
+![Time by project](images/time-by-project.png)
 
 | Gap ends in | Bucket | Meaning |
 | --- | --- | --- |
@@ -403,6 +437,10 @@ Two things the transcript cannot show, so neither can this report: time you spen
 
 `<project>` is the project path, an unambiguous trailing segment, or the transcript folder under `~/.claude/projects/` (full path — a bare slug starts with `-` and would be read as an option).
 
+The single-session view with its per-turn table — in the TUI, **Time breakdown** inside a session, `v`:
+
+![Time breakdown of one session, per turn](images/time-session-turns.png)
+
 Example (`--session … -v`):
 
 ```
@@ -434,6 +472,8 @@ In the TUI: **Time analytics** (all projects, `v` for by-date; a project or merg
 ### `export-prompts.py`
 
 Writes the prompts you typed. Default: one text file per session in `~/cct-export/<project>/` (override with `-o DIR` or `$CCT_EXPORT_DIR`), named `YYYY-MM-DD_HHMM_<shortid>.txt` from the session's local start time. Nothing is ever overwritten: if any target file already exists, the export stops before writing anything, lists the files in the way and exits 3 — pick another folder or move the old files yourself.
+
+![Export prompts](images/export-prompts.png)
 
 ```bash
 ./export-prompts.py <project> [-o DIR] [--json]
