@@ -80,8 +80,12 @@ pad_chars() {
   printf '%s%*s' "$s" "$p" ""
 }
 
+# Main transcripts (<slug>/<session>.jsonl) plus the transcripts of
+# background agents (Agent tool, Workflow), which Claude Code keeps under
+# <slug>/<session>/subagents/ with their own usage.
 collect_events() {
-  find "$ROOT" -maxdepth 2 -name "*.jsonl" -print0 2>/dev/null \
+  { find "$ROOT" -maxdepth 2 -name "*.jsonl" -print0
+    find "$ROOT" -path "*/subagents/*" -name "*.jsonl" -print0; } 2>/dev/null \
     | xargs -0 cat 2>/dev/null
 }
 

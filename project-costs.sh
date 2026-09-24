@@ -117,11 +117,14 @@ pad_chars() {
   printf '%s%*s' "$s" "$p" ""
 }
 
-# Concatenate the transcripts of one or more project folders.
+# Concatenate the transcripts of one or more project folders: the sessions
+# themselves plus the background-agent transcripts (Agent tool, Workflow)
+# that Claude Code keeps under <session>/subagents/ with their own usage.
 cat_dirs() {
   local d
   for d in "$@"; do
     cat "$d"/*.jsonl 2>/dev/null || true
+    find "$d" -path "*/subagents/*" -name "*.jsonl" -exec cat {} + 2>/dev/null || true
   done
 }
 

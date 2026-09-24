@@ -112,10 +112,11 @@ they were; bindings live in `~/.config/cct/merges.json`.
 
 ### Where the time goes
 
-**Time analytics** turns the event timestamps of every session into four
+**Time analytics** turns the event timestamps of every session into five
 buckets: **Claude working** (generating, including thinking), **tools running**
-(tool calls incl. permission dialogs), **waiting on you** (questions, plan
-approval, declined prompts) and **you** (reading and typing between turns).
+(tool calls incl. permission dialogs), **agents** (background agents and
+workflows running while the main thread waited), **waiting on you** (questions,
+plan approval, declined prompts) and **you** (reading and typing between turns).
 Gaps longer than 30 minutes count as breaks and are left out of active time.
 You get it per project, per day, per session, and per turn inside one session
 (how long each reply took, how many tool calls, what it cost). Days are local
@@ -138,8 +139,10 @@ Keys: ↑/↓ or `j`/`k`, PgUp/PgDn, Home/End, Enter selects, Esc or `q` goes ba
 `v` toggles the extended view where offered, Ctrl-C quits.
 
 Costs are **estimates** computed from token counts at public list prices; actual
-billing may differ. The price table is one file, `pricing.json` — edit it there
-when prices change and every view picks it up.
+billing may differ. Background agents and workflows are priced from their own
+transcripts, so a session that fans out work costs what it really cost. The
+price table is one file, `pricing.json` — edit it there when prices change and
+every view picks it up.
 
 ## Scripts on their own
 

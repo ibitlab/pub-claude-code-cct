@@ -25,8 +25,10 @@ def cost_of(u; p):
   ) / 1e6;
 
 # Claude Code writes one transcript line per content block of an API message
-# (thinking, text, each tool_use), and every line repeats the whole message
-# usage. Keep one line per message or costs come out 2-3x too high.
+# (thinking, text, each tool_use), and every line repeats the message usage.
+# Keep one line per message or costs come out 2-3x too high — the LAST one:
+# in background-agent transcripts the usage grows from block to block and
+# only the final line carries the full figures.
 def msg_id: .message.id // .requestId // .uuid // tojson;
 def priced: [ .[] | select(.type=="assistant" and .message.usage) ]
             | group_by(msg_id) | map(last);

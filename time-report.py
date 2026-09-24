@@ -6,6 +6,9 @@ attributed to whoever was busy during it:
 
   claude working   prompt / tool result → Claude's next output (incl. thinking)
   tools running    tool call → its result (execution + permission dialogs)
+  agents           background agents / workflows running while the main
+                   thread waited (their transcripts live under
+                   <session-id>/subagents/ and are priced from there)
   waiting on you   AskUserQuestion, plan approval, a declined tool call, or a
                    permission prompt you answered with Esc
   you              Claude finished → your next prompt (reading, typing)
@@ -49,16 +52,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cct_lib as L  # noqa: E402
 
-COLS = ("active", "working", "tools", "waiting", "idle", "breaks")
-HEAD = ("active", "working", "tools", "waiting", "you", "breaks")
+COLS = ("active", "working", "tools", "agents", "waiting", "idle", "breaks")
+HEAD = ("active", "working", "tools", "agents", "waiting", "you", "breaks")
 def legend(args) -> str:
     """Printed under every table: what each column counts."""
     lines = [
         "  working   Claude generating (thinking included)",
         "  tools     tool calls running, permission dialogs included",
+        "  agents    background agents / workflows running while the main thread waited",
         "  waiting   Claude blocked on you: question, plan approval, declined call",
         "  you       reading / typing between Claude's answer and your next prompt",
-        "  active    working + tools + waiting + you",
+        "  active    working + tools + agents + waiting + you",
         f"  breaks    pauses over {args.break_min:g}m while waiting on you; not part of active",
     ]
     if args.day_start:
@@ -205,13 +209,16 @@ def print_session(a: L.SessionAnalysis, args):
             "id": a.id, "title": a.title, "cwd": a.cwd,
             "started": L.fmt_utc(a.first), "ended": L.fmt_utc(a.last),
             "wall": round(b.wall), **b.to_json(),
-            "cost_usd": round(a.cost, 4), "models": dict(a.models),
+            "cost_usd": round(a.cost_total, 4), "cost_main_usd": round(a.cost, 4),
+            "cost_agents_usd": round(a.cost_agents, 4), "models": dict(a.models),
+            "agent_runs": a.agent_runs, "agent_runtime": round(a.agent_runtime),
             "longest_tool": {"name": a.longest_tool[0], "seconds": round(a.longest_tool[1])},
             "turns": [{
                 "n": p.n, "ts": L.fmt_utc(p.ts) if p.ts else None,
                 "response_seconds": round(p.response_secs) if p.response_secs is not None else None,
                 "working_seconds": round(p.working_secs), "tool_calls": sum(p.tools.values()),
-                "tools": dict(p.tools), "cost_usd": round(p.cost, 4),
+                "tools": dict(p.tools), "cost_usd": round(p.cost + p.cost_agents, 4),
+                "cost_agents_usd": round(p.cost_agents, 4),
                 "interrupted": p.interrupted, "prompt": p.text,
             } for p in a.prompts],
         }
@@ -231,7 +238,7 @@ def print_session(a: L.SessionAnalysis, args):
     print()
 
     act = b.active or 1.0
-    mx = max(b.working, b.tools, b.waiting, b.idle, 1.0)
+    mx = max(b.working, b.tools, b.agents, b.waiting, b.idle, 1.0)
 
     def line(label, secs, note=""):
         pct = 100.0 * secs / act
@@ -243,6 +250,9 @@ def print_session(a: L.SessionAnalysis, args):
     line("tools running", b.tools)
     if b.approval_n:
         print(f"    likely permission prompts {L.fmt_dur_long(b.approval):>9}  ({b.approval_n} instant tool(s) > {args.approve_secs}s)")
+    if a.agent_runs:
+        line("background agents", b.agents, "workflows / Agent tool while the main thread waited")
+        print(f"    {a.agent_runs} run(s), {L.fmt_dur_long(a.agent_runtime)} of agent time in total, ${a.cost_agents:.2f}")
     line("waiting on you", b.waiting, "questions / plan approval / declined prompts")
     line("you (reading, typing)", b.idle)
     print()
@@ -256,7 +266,8 @@ def print_session(a: L.SessionAnalysis, args):
     if a.longest_tool[0]:
         print(f"longest tool:  {a.longest_tool[0]} {L.fmt_dur_long(a.longest_tool[1])}")
     models = ", ".join(sorted(a.models))
-    print(f"cost:          ${a.cost:.2f} (list prices)   models: {models or '?'}")
+    agents = f" = ${a.cost:.2f} main + ${a.cost_agents:.2f} agents" if a.agent_runs else ""
+    print(f"cost:          ${a.cost_total:.2f} (list prices){agents}   models: {models or '?'}")
 
     if args.verbose and a.prompts:
         print()
@@ -267,10 +278,10 @@ def print_session(a: L.SessionAnalysis, args):
             flag = " ⏎" if p.interrupted else ""
             text = p.text.split("\n", 1)[0]
             print(f"{p.n:>3}  {when:16} {reply:>8} {L.fmt_dur(p.working_secs):>8} {sum(p.tools.values()):>5}"
-                  f" ${p.cost:6.2f}  {text[:44]}{flag}")
+                  f" ${p.cost + p.cost_agents:6.2f}  {text[:44]}{flag}")
     print()
     print("  (times come from event timestamps; tool time includes permission dialogs;")
-    print("   subagent work runs inside the Agent tool's gap)")
+    print("   background agents are priced from their own transcripts)")
 
 
 # ---------------------------------------------------------------- main

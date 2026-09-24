@@ -55,8 +55,9 @@ A few useful specialized event types:
 
 Two traps worth knowing before you write your own pipeline:
 
-- **One API message = several `assistant` lines.** Claude Code writes one line per content block (thinking, text, each `tool_use`), all sharing the same `message.id` (newer versions also carry `apiBlockIndex`), and **every line repeats the whole message's `usage`**. Summing usage over lines overcounts tokens and cost 2–3×. All cct cost scripts keep one line per `message.id` (`msg_id` / `priced` in the jq defs).
+- **One API message = several `assistant` lines.** Claude Code writes one line per content block (thinking, text, each `tool_use`), all sharing the same `message.id` (newer versions also carry `apiBlockIndex`), and **every line repeats the whole message's `usage`**. Summing usage over lines overcounts tokens and cost 2–3×. All cct cost scripts keep one line per `message.id` (`msg_id` / `priced` in the jq defs) — the **last** one, because in background-agent transcripts the usage grows from block to block and only the final line has the full figures.
 - **`last-prompt` is a clipped snapshot.** `lastPrompt` is cut at 200 characters (then `…`), has newlines flattened, and the same snapshot is re-emitted many times per turn. The verbatim text lives in the timestamped `user` event a few lines earlier, as its own text block next to wrapper blocks (`<ide_selection>`, `<ide_opened_file>`, …); that is where `export-prompts.py` takes it from.
+- **Background agents have their own transcripts.** The Agent tool and Workflow runs write `<slug>/<session-id>/subagents/**/*.jsonl` (plus `started` / `result` / `failed` bookkeeping lines). Their `assistant` lines carry their own `usage` that never appears in the main transcript, so a session that fans out work costs more than its main file says. Every cct cost view reads those files too; `time-report.py` shows their runtime as `agents`.
 - **After `/compact` the history is written again.** Each compaction re-appends the earlier `user`/`assistant` lines as exact copies — same `uuid`, same `timestamp` — so a long session can hold every event three or four times. Anything that counts events (tool calls, file touches, time between events) must keep the first line per `uuid`; cct does (`dedup_events` in `pricing.jq`, the same rule in `cct_lib.py`). Cost is already safe because it keeps one line per `message.id`.
 
 Since it's append-only JSONL, any `jq` / `awk` pipeline works against it.
@@ -188,7 +189,7 @@ Prices are list USD per 1M tokens (as of 2026-09) and live in **one file, `prici
 
 Unknown model ids are costed at current Opus rates.
 
-If a session used multiple models, cost is split and summed per model. Actual billing may differ (contract rates, batch API discounts, server-tool fees for web search/fetch are not included).
+If a session used multiple models, cost is split and summed per model. Background-agent transcripts of the session (`<session-id>/subagents/`) are included and reported on an `agents:` line. Actual billing may differ (contract rates, batch API discounts, server-tool fees for web search/fetch are not included).
 
 ### `session-tools.sh`
 
@@ -261,7 +262,7 @@ summary: 2 dead, 0 unknown
 
 ### `cost-report.sh`
 
-Aggregates estimated token cost across every transcript, using the same pricing table as `session-stats.sh` (see [Cost model](#cost-model)).
+Aggregates estimated token cost across every transcript — sessions and their background-agent transcripts — using the same pricing table as `session-stats.sh` (see [Cost model](#cost-model)).
 
 ![Cost report, extended](images/cost-report-extended.png)
 
@@ -356,11 +357,12 @@ Where the hours went. Only timestamped `user`/`assistant` events on the main thr
 | --- | --- | --- |
 | assistant output | **claude working** | generating, including thinking (reported separately when the transcript has per-block lines) |
 | a tool result | **tools running** | tool execution, including the permission dialog in front of it. `AskUserQuestion`, `ExitPlanMode` and declined calls go to *waiting* instead. An instant tool (Read, Edit, Glob, …) that took longer than `--approve-secs` (15) is flagged as a likely permission prompt |
-| a typed prompt | **you** | Claude was done, you were reading or typing. A prompt you answered with Esc while a tool call was pending counts as *waiting* |
+| a typed prompt | **you** | Claude was done, you were reading or typing. A prompt you answered with Esc while a tool call was pending counts as *waiting*. If a background agent or workflow (transcripts under `<session-id>/subagents/`) was running during the gap, that part is **agents** instead |
+| Claude's next reply, with no prompt from you | *(as a `you` gap)* | Claude resumed by itself: auto-continue after a usage limit ("Continue from where you left off"), a background-task notification. Nothing was generating, so the gap is split into agents / you / break like an idle gap |
 
 Any gap longer than `--break-min` (30) that was waiting on a person — an idle gap, a question, a pending tool call — is a **break** and leaves active time: a permission dialog left open overnight is not tool time. (A tool that genuinely ran longer than the threshold lands there too; rare, and the threshold is yours to set.) Only Claude's own generation is never capped.
 
-`active = working + tools + waiting + you`; `wall = active + breaks`. Sub-agent work runs inside the Agent tool's gap and is not separated out. Lines replayed after `/compact` are ignored (first line per `uuid`). A gap is attributed to the local calendar date it starts on — a session that crosses midnight is split between the two dates. If you would rather count a day from a later hour, `--day-start H` (or `CCT_DAY_START=H`) does that; it is off by default.
+`active = working + tools + agents + waiting + you`; `wall = active + breaks`. Lines replayed after `/compact` are ignored (first line per `uuid`). A gap is attributed to the local calendar date it starts on — a session that crosses midnight is split between the two dates. If you would rather count a day from a later hour, `--day-start H` (or `CCT_DAY_START=H`) does that; it is off by default.
 
 #### Columns
 
@@ -372,13 +374,14 @@ The by-project, by-date and per-session tables share these columns. Durations pr
 | `active` | `working + tools + waiting + you`. Everything except breaks — the time somebody (Claude, a tool, or you) was actually busy in the session. |
 | `working` | Gaps that end in Claude's output: from your prompt to its first block, between its blocks, from a tool result to its next block. Thinking is inside this number; the single-session view breaks it out as *of which thinking* when the transcript has per-block lines. Never capped — Claude does not take breaks. |
 | `tools` | Gaps that end in a tool result: the tool running, plus the permission dialog in front of it, which the transcript cannot tell apart. Instant tools (Read, Edit, Write, Glob, Grep, …) slower than `--approve-secs` are counted here but flagged as *likely permission prompts* in the single-session view. |
+| `agents` | Time a background agent or workflow was running while the main thread had nothing to do (otherwise a `you` gap or a break). Overlapping agents count once. The single-session view also shows the number of runs, their total runtime and their cost. |
 | `waiting` | Claude blocked on you: `AskUserQuestion`, `ExitPlanMode` (plan approval), a tool call you declined, or a permission prompt you left with Esc. |
 | `you` | Gaps that end in your next typed prompt after Claude finished: reading the answer, thinking, typing, poking around the IDE. |
 | `breaks` | Any gap longer than `--break-min` (30) that was waiting on a person — a `you` gap, a `waiting` gap, or a pending tool call. Left out of `active`; the single-session view shows how many there were. Attributed to the date the gap *starts* on. |
 
 Per-session table adds `started` (local time of the first event), `id` (first 8 characters of the session UUID), `prompts` (distinct typed prompts) and `title` (Claude's auto-title, else the first prompt).
 
-The single-session view (`--session`) shows the same buckets with their share of `active`, plus `wall` (first event → last event, equals `active + breaks`), the median and slowest *reply* (prompt → Claude's last output of that turn, tools and waiting included), the longest single tool call, and cost and models. Its per-turn table (`-v`) has one row per prompt: `reply` as above, `working` (Claude generation only, within that turn), `tools` (number of tool calls), `cost`, and the prompt's first line (`⏎` marks a turn you interrupted).
+The single-session view (`--session`) shows the same buckets with their share of `active`, plus `wall` (first event → last event, equals `active + breaks`), the median and slowest *reply* (prompt → Claude's last output of that turn, tools and waiting included), the longest single tool call, and cost (main transcript + background agents) and models. Its per-turn table (`-v`) has one row per prompt: `reply` as above, `working` (Claude generation only, within that turn), `tools` (number of tool calls), `cost`, and the prompt's first line (`⏎` marks a turn you interrupted).
 
 Two caveats when reading sums: sessions running side by side each count in full, so a date's total across projects can exceed the clock; and a session that crosses midnight is split between the two dates. A live session is counted up to its last written event, so the turn still in progress is not in yet.
 
@@ -467,10 +470,11 @@ list sessions shows command wrapper, not real prompt
       "slug": "-path-to-some-project", "cwd": "/path/to/some-project",
       "started": "2026-04-17T13:26:32.000Z", "ended": "2026-04-17T16:04:50.000Z",
       "started_local": "2026-04-17 15:26:32", "ended_local": "2026-04-17 18:04:50",
-      "prompt_count": 6, "cost_usd": 15.40, "models": { "claude-opus-4-7": 120 },
+      "prompt_count": 6, "cost_usd": 15.40, "cost_main_usd": 15.40, "cost_agents_usd": 0,
+      "agent_runs": 0, "models": { "claude-opus-4-7": 120 },
       "time": { "wall": 9498, "active": 6700, "working": 2412, "thinking": 843,
-                "tools": 2345, "approval": 0, "approval_calls": 0, "waiting": 130,
-                "idle": 1813, "breaks": 2798, "break_count": 1 },
+                "tools": 2345, "approval": 0, "approval_calls": 0, "agents": 0,
+                "waiting": 130, "idle": 1813, "breaks": 2798, "break_count": 1 },
       "prompts": [
         { "n": 1, "ts": "2026-04-17T13:26:32.000Z", "local": "2026-04-17 15:26:32",
           "ts_approx": false,
@@ -478,10 +482,11 @@ list sessions shows command wrapper, not real prompt
           "chars": 67, "words": 13, "lines": 1,
           "response_seconds": 1263, "working_seconds": 700,
           "tool_calls": 31, "tools": { "Bash": 12, "Read": 8, "Edit": 7, "Write": 3, "Grep": 1 },
-          "cost_usd": 5.94, "models": ["claude-opus-4-7"], "interrupted": false } ] } ] }
+          "cost_usd": 5.94, "cost_agents_usd": 0, "models": ["claude-opus-4-7"],
+          "interrupted": false } ] } ] }
 ```
 
-`ts_approx` is true when no typed user event preceded the snapshot (the timestamp is then the nearest earlier event). Times in seconds; `response_seconds` is prompt → Claude's last output of that turn.
+`ts_approx` is true when no typed user event preceded the snapshot (the timestamp is then the nearest earlier event). Times in seconds; `response_seconds` is prompt → Claude's last output of that turn. `cost_usd` includes the background agents started during that turn (`cost_agents_usd` is that part alone).
 
 In the TUI: **Export prompts** (pick a project or merged project → format → folder), the same inside a merged project, and **Export prompts of this session** in the session action menu.
 
@@ -523,4 +528,4 @@ High touches with low files = heavy iteration on a small set (e.g. `Bash 81/14`)
 - **`session-grep.sh <pattern>`** — full-text search across every transcript for a pattern.
 - **`tool-usage-all.sh`** — tally tool usage across _every_ session (useful for tuning the `less-permission-prompts` allowlist).
 - **Time by hour of day / weekday** — the buckets in `cct_lib.analyze_session` are keyed by gap start, so a heat map of when you actually work is one `group_by` away.
-- **Sub-agent cost** — `~/.claude/projects/<slug>/<session>/subagents/*.jsonl` hold Agent-tool transcripts with their own usage; none of the cost scripts include them yet.
+- **Per-agent view** — `session-tools.sh` reports the main thread only; the tool calls of each background agent (`<session>/subagents/`) are there for a per-workflow breakdown.

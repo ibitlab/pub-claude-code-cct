@@ -49,8 +49,19 @@ fmt_num() {
 FILE=$(resolve_session "${1:?session id or path required}")
 ID=$(basename "$FILE" .jsonl)
 
+# Background agents (Agent tool, Workflow) of this session write their own
+# transcripts under <session-id>/subagents/; their usage is real spend, so
+# the token and cost blocks read them too.
+FILES=("$FILE")
+while IFS= read -r f; do
+  [[ -n "$f" ]] && FILES+=("$f")
+done < <(find "${FILE%.jsonl}/subagents" -name '*.jsonl' 2>/dev/null | sort)
+
 echo "session: $ID"
 echo "file:    $FILE"
+if (( ${#FILES[@]} > 1 )); then
+  echo "agents:  $(( ${#FILES[@]} - 1 )) background-agent transcript(s) included"
+fi
 echo
 
 # Timestamps — use jq's `first(inputs|…)` instead of `jq | head -1`, which
@@ -78,12 +89,12 @@ echo
 
 # Models used (per API message)
 echo "models:"
-jq -rs "$JQ_DEFS"'priced[] | .message.model' "$FILE" | sort | uniq -c | sort -rn | sed 's/^/  /'
+jq -rs "$JQ_DEFS"'priced[] | .message.model' "${FILES[@]}" | sort | uniq -c | sort -rn | sed 's/^/  /'
 echo
 
 # Stop reasons (per API message)
 echo "stop reasons:"
-jq -rs "$JQ_DEFS"'priced[] | .message.stop_reason // "?"' "$FILE" | sort | uniq -c | sort -rn | sed 's/^/  /'
+jq -rs "$JQ_DEFS"'priced[] | .message.stop_reason // "?"' "${FILES[@]}" | sort | uniq -c | sort -rn | sed 's/^/  /'
 echo
 
 # Token usage totals (as JSON, used by both the display block and the cost block)
@@ -100,7 +111,7 @@ TOTALS=$(jq -s "$JQ_DEFS"'
       web_searches: ($u | map(.server_tool_use.web_search_requests // 0) | add),
       web_fetches: ($u | map(.server_tool_use.web_fetch_requests // 0) | add)
     }
-' "$FILE")
+' "${FILES[@]}")
 
 echo "tokens:"
 # Render large numbers with comma thousands separators so they're eyeballable.
@@ -128,7 +139,7 @@ price_for_model() {
 
 # If the session used a single model, cost it against that model's rates.
 # If multiple, sum per-model by grouping assistant events.
-MODELS=$(jq -rs "$JQ_DEFS"'priced[] | .message.model' "$FILE" | sort -u)
+MODELS=$(jq -rs "$JQ_DEFS"'priced[] | .message.model' "${FILES[@]}" | sort -u)
 MODEL_COUNT=$(echo "$MODELS" | grep -c .)
 
 echo "cost (estimate, list prices):"
@@ -163,22 +174,23 @@ else
   while IFS= read -r MODEL; do
     [[ -z "$MODEL" ]] && continue
     price_for_model "$MODEL"
+    # One "key value" line per token class — plain words, so awk can match
+    # them (JSON output would quote the keys and nothing would match).
     SUBTOTALS=$(jq -rs --arg m "$MODEL" "$JQ_DEFS"'
       [priced[] | select(.message.model==$m) | .message.usage] as $u
-      | {
-          input:     ($u | map(.input_tokens // 0) | add),
-          output:    ($u | map(.output_tokens // 0) | add),
-          read:      ($u | map(.cache_read_input_tokens // 0) | add),
-          cache_5m:  ($u | map(.cache_creation.ephemeral_5m_input_tokens // 0) | add),
-          cache_1h:  ($u | map(.cache_creation.ephemeral_1h_input_tokens // 0) | add)
-        }' "$FILE")
+      | "input \($u | map(.input_tokens // 0) | add // 0)",
+        "output \($u | map(.output_tokens // 0) | add // 0)",
+        "read \($u | map(.cache_read_input_tokens // 0) | add // 0)",
+        "cache_5m \($u | map(.cache_creation.ephemeral_5m_input_tokens // 0) | add // 0)",
+        "cache_1h \($u | map(.cache_creation.ephemeral_1h_input_tokens // 0) | add // 0)"
+      ' "${FILES[@]}")
     cost=$(echo "$SUBTOTALS" | awk \
         -v pi="$P_IN" -v po="$P_OUT" -v pr="$P_READ" -v pf="$P_5M" -v ph="$P_1H" '
-        /input:/     { gsub(",",""); i=$2 }
-        /output:/    { gsub(",",""); o=$2 }
-        /read:/      { gsub(",",""); r=$2 }
-        /cache_5m:/  { gsub(",",""); f=$2 }
-        /cache_1h:/  { gsub(",",""); h=$2 }
+        $1 == "input"    { i=$2 }
+        $1 == "output"   { o=$2 }
+        $1 == "read"     { r=$2 }
+        $1 == "cache_5m" { f=$2 }
+        $1 == "cache_1h" { h=$2 }
         END { printf "%.4f", (i*pi + o*po + r*pr + f*pf + h*ph)/1e6 }')
     printf '  %-20s $%s\n' "$MODEL" "$cost"
     TOTAL=$(awk -v a="$TOTAL" -v b="$cost" 'BEGIN{printf "%.4f", a+b}')

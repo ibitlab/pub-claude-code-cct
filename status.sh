@@ -60,7 +60,9 @@ YESTERDAY_ISO=$(to_utc_iso "$yesterday_epoch")
 WEEK_ISO=$(to_utc_iso "$monday_epoch")
 MONTH_ISO=$(to_utc_iso "$month_epoch")
 
-AGG=$(find "$ROOT" -maxdepth 2 -name "*.jsonl" -print0 2>/dev/null \
+# Main transcripts plus background-agent transcripts (<session>/subagents/).
+AGG=$({ find "$ROOT" -maxdepth 2 -name "*.jsonl" -print0
+        find "$ROOT" -path "*/subagents/*" -name "*.jsonl" -print0; } 2>/dev/null \
   | xargs -0 cat 2>/dev/null \
   | jq -sr --arg d "$TODAY_ISO" --arg y "$YESTERDAY_ISO" \
            --arg w "$WEEK_ISO" --arg m "$MONTH_ISO" "$JQ_DEFS"'

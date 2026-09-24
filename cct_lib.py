@@ -373,6 +373,7 @@ class Buckets:
     tools: float = 0.0       # tool_use → tool_result (execution + permission dialogs)
     approval: float = 0.0    # of tools: instant tools that stalled → likely permission prompt
     approval_n: int = 0
+    agents: float = 0.0      # background agents / workflows running while the main thread waited
     waiting: float = 0.0     # blocked on you: question / plan approval / declined prompt
     idle: float = 0.0        # Claude done, you reading / typing (≤ break threshold)
     breaks: float = 0.0      # idle gaps above the threshold — excluded from active
@@ -380,7 +381,7 @@ class Buckets:
 
     @property
     def active(self) -> float:
-        return self.working + self.tools + self.waiting + self.idle
+        return self.working + self.tools + self.agents + self.waiting + self.idle
 
     @property
     def wall(self) -> float:
@@ -392,6 +393,7 @@ class Buckets:
         self.tools += o.tools
         self.approval += o.approval
         self.approval_n += o.approval_n
+        self.agents += o.agents
         self.waiting += o.waiting
         self.idle += o.idle
         self.breaks += o.breaks
@@ -402,6 +404,7 @@ class Buckets:
             "active": round(self.active), "working": round(self.working),
             "thinking": round(self.thinking), "tools": round(self.tools),
             "approval": round(self.approval), "approval_calls": self.approval_n,
+            "agents": round(self.agents),
             "waiting": round(self.waiting), "idle": round(self.idle),
             "breaks": round(self.breaks), "break_count": self.breaks_n,
         }
@@ -418,7 +421,8 @@ class Prompt:
     response_secs: float | None = None   # prompt → Claude's last output of the turn
     working_secs: float = 0.0
     tools: Counter = field(default_factory=Counter)
-    cost: float = 0.0
+    cost: float = 0.0         # main transcript
+    cost_agents: float = 0.0  # background agents started during this turn
     models: set = field(default_factory=set)
     interrupted: bool = False
 
@@ -427,6 +431,7 @@ class Prompt:
 class _Actor:
     ts: float
     kind: str                 # "U" typed prompt, "A" assistant, "R" tool result
+    mid: str | None = None    # API message id (all blocks of one reply share it)
     thinking_only: bool = False
     tool_uses: list = field(default_factory=list)
     stop: str | None = None
@@ -462,6 +467,61 @@ def _full_prompt_text(snapshot: str, texts: list) -> str:
     return snapshot
 
 
+def agent_files(main: Path) -> list:
+    """Transcripts of the background agents (Agent tool, Workflow) of a
+    session: <folder>/<session-id>/subagents/**/*.jsonl."""
+    sub = main.parent / main.stem / "subagents"
+    return sorted(sub.rglob("*.jsonl")) if sub.is_dir() else []
+
+
+def _agent_runs(main: Path) -> list:
+    """[(start, end, cost, api_messages)] per background-agent transcript.
+    Their usage is not in the main transcript, so it is priced here."""
+    runs = []
+    for f in agent_files(main):
+        first = last = None
+        msg_cost: dict = {}
+        for ev in iter_events(f):
+            ts = parse_ts(ev.get("timestamp"))
+            if ts is not None:
+                first = ts if first is None or ts < first else first
+                last = ts if last is None or ts > last else last
+            if ev.get("type") == "assistant":
+                msg = ev.get("message") or {}
+                if msg.get("usage"):
+                    # Usage grows across the block lines of one streamed
+                    # reply; the last line carries the final figures.
+                    mid = msg.get("id") or ev.get("uuid")
+                    msg_cost[mid] = cost_of(msg["usage"], msg.get("model"))
+        if first is not None:
+            runs.append((first, last, sum(msg_cost.values()), len(msg_cost)))
+    return runs
+
+
+def _merge_intervals(spans) -> list:
+    out: list = []
+    for s, e in sorted(spans):
+        if out and s <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], e))
+        else:
+            out.append((s, e))
+    return out
+
+
+def _overlap(s: float, e: float, intervals) -> float:
+    """Seconds of [s, e] covered by the (merged) intervals."""
+    if e <= s:
+        return 0.0
+    total = 0.0
+    for a, b in intervals:
+        if b <= s:
+            continue
+        if a >= e:
+            break
+        total += min(b, e) - max(a, s)
+    return total
+
+
 @dataclass
 class SessionAnalysis:
     id: str
@@ -475,9 +535,16 @@ class SessionAnalysis:
     by_date: dict           # 'YYYY-MM-DD' → Buckets (local dates)
     prompts: list
     longest_tool: tuple     # (name, secs)
-    cost: float
+    cost: float             # main transcript only
     models: Counter
     has_block_events: bool  # per-block assistant lines → thinking time is measurable
+    agent_runs: int = 0     # background-agent transcripts (Agent tool, Workflow)
+    agent_runtime: float = 0.0   # their wall time, overlaps merged
+    cost_agents: float = 0.0
+
+    @property
+    def cost_total(self) -> float:
+        return self.cost + self.cost_agents
 
     @property
     def short_id(self) -> str:
@@ -533,6 +600,14 @@ def analyze_session(path: Path, break_secs: float = DEFAULT_BREAK_SECS,
     overnight is not tool time) — is a break and leaves active time. Only
     Claude's own generation is never capped.
 
+    Background agents (Agent tool, Workflow) write their own transcripts
+    under <session-id>/subagents/. The main thread just waits for them, so
+    the part of an idle gap during which such an agent ran is `agents`, not
+    `you` or a break. Their usage is priced into `cost_agents`. When Claude
+    resumes without a prompt from you (auto-continue after a usage limit,
+    a background-task notification) the gap before it is treated the same
+    way as an idle gap — nothing was generating.
+
     `day_start_secs` shifts the by-date bucketing: 4*3600 makes a day run
     from 04:00 to 04:00 local, so a session that crosses midnight stays on
     one date.
@@ -540,10 +615,9 @@ def analyze_session(path: Path, break_secs: float = DEFAULT_BREAK_SECS,
     actors: list[_Actor] = []
     prompts: list[Prompt] = []
     tool_names: dict = {}
-    seen_msgs: set = set()
     seen_uuids: set = set()
-    models: Counter = Counter()
-    cost = 0.0
+    msg_cost: dict = {}      # message id → cost from its LAST line (usage grows per block)
+    msg_model: dict = {}
     title = cwd = None
     first = last = None
     last_seen_ts = None
@@ -604,16 +678,15 @@ def analyze_session(path: Path, break_secs: float = DEFAULT_BREAK_SECS,
                     if b.get("id"):
                         tool_names[b["id"]] = b.get("name") or "?"
             mid = msg.get("id") or ev.get("requestId") or ev.get("uuid")
-            c = 0.0
             model = msg.get("model")
-            if mid not in seen_msgs and msg.get("usage"):
-                seen_msgs.add(mid)
-                c = cost_of(msg["usage"], model)
-                cost += c
-                models[model or "unknown"] += 1
-            actors.append(_Actor(ts=ts, kind="A",
+            if msg.get("usage"):
+                # One reply spans several lines and its usage grows from
+                # block to block; the last line has the final figures.
+                msg_cost[mid] = cost_of(msg["usage"], model)
+                msg_model[mid] = model
+            actors.append(_Actor(ts=ts, kind="A", mid=mid,
                                  thinking_only=bool(kinds) and all(k == "thinking" for k in kinds),
-                                 tool_uses=uses, stop=msg.get("stop_reason"), cost=c, model=model))
+                                 tool_uses=uses, stop=msg.get("stop_reason"), model=model))
             continue
         # user
         if _is_tool_result(ev, content):
@@ -661,17 +734,44 @@ def analyze_session(path: Path, break_secs: float = DEFAULT_BREAK_SECS,
     # gap index → seconds counted as working (for per-turn sums)
     working_gap: dict = {}
 
+    runs = _agent_runs(path)
+    agent_iv = _merge_intervals([(s, e) for s, e, _, _ in runs])
+
+    def put(day: Buckets, what: str, secs: float) -> None:
+        setattr(total, what, getattr(total, what) + secs)
+        setattr(day, what, getattr(day, what) + secs)
+
+    def pause(day: Buckets, s: float, e: float) -> None:
+        """Nobody on the main thread was generating between s and e. Time a
+        background agent was running is `agents`; the rest is you reading /
+        typing, or a break once it exceeds the threshold."""
+        ov = _overlap(s, e, agent_iv)
+        if ov:
+            put(day, "agents", ov)
+        rest = max(0.0, e - s) - ov
+        if rest > break_secs:
+            put(day, "breaks", rest)
+            total.breaks_n += 1
+            day.breaks_n += 1
+        elif rest > 0:
+            put(day, "idle", rest)
+
     for i in range(1, len(actors)):
         a, b = actors[i - 1], actors[i]
         d = max(0.0, b.ts - a.ts)
         day = by_date[local_date(a.ts - day_start_secs)]
         if b.kind == "A":
-            total.working += d
-            day.working += d
+            if a.kind == "A" and a.mid != b.mid:
+                # Claude started a new reply with no prompt from you in
+                # between: auto-continue after a usage limit ("Continue from
+                # where you left off"), a background-task notification.
+                # Nothing was generating during the gap.
+                pause(day, a.ts, b.ts)
+                continue
+            put(day, "working", d)
             working_gap[i] = d
             if b.thinking_only:
-                total.thinking += d
-                day.thinking += d
+                put(day, "thinking", d)
         elif b.kind == "R":
             user_side = any(n in ASK_TOOLS for n in b.tools) or b.denied
             suspect = bool(b.tools) and all(n in INSTANT_TOOLS for n in b.tools) and d > approve_secs
@@ -681,50 +781,64 @@ def analyze_session(path: Path, break_secs: float = DEFAULT_BREAK_SECS,
                 # prompt left open overnight is not tool time. (A tool that
                 # genuinely ran longer than the threshold lands here too;
                 # rare, and the threshold is adjustable.)
-                total.breaks += d
-                day.breaks += d
+                put(day, "breaks", d)
                 total.breaks_n += 1
                 day.breaks_n += 1
             elif user_side:
-                total.waiting += d
-                day.waiting += d
+                put(day, "waiting", d)
             else:
-                total.tools += d
-                day.tools += d
+                put(day, "tools", d)
                 if suspect:
-                    total.approval += d
-                    day.approval += d
+                    put(day, "approval", d)
                     total.approval_n += 1
                     day.approval_n += 1
                 if d > longest_tool[1]:
                     longest_tool = ("+".join(dict.fromkeys(b.tools)) or "?", d)
-        else:  # typed prompt ends the gap
-            if d > break_secs:
-                total.breaks += d
-                day.breaks += d
-                total.breaks_n += 1
-                day.breaks_n += 1
-            elif b.interrupted and a.kind == "A" and a.stop == "tool_use":
-                total.waiting += d          # you sat at a permission prompt, then hit Esc
-                day.waiting += d
+        else:  # your typed prompt ends the gap
+            if b.interrupted and a.kind == "A" and a.stop == "tool_use":
+                # you sat at a permission prompt, then hit Esc
+                if d > break_secs:
+                    put(day, "breaks", d)
+                    total.breaks_n += 1
+                    day.breaks_n += 1
+                else:
+                    put(day, "waiting", d)
             elif b.interrupted:
-                total.working += d          # Claude was mid-generation when you hit Esc
-                day.working += d
+                put(day, "working", d)      # Claude was mid-generation when you hit Esc
                 working_gap[i] = d
             else:
-                total.idle += d
-                day.idle += d
+                pause(day, a.ts, b.ts)
+
+    # Background agents started during a turn are billed to that turn.
+    timed = [p for p in prompts if p.ts is not None]
+    for s, _e, c, _n in runs:
+        owner = None
+        for p in timed:
+            if p.ts <= s:
+                owner = p
+            else:
+                break
+        if owner is not None:
+            owner.cost_agents += c
+
+    cost = sum(msg_cost.values())
+    models: Counter = Counter(
+        (m or "unknown") for m in msg_model.values()
+        if not (m or "").startswith("<"))            # "<synthetic>" placeholders
 
     # Per-turn stats.
     for p in prompts:
         span = actors[p.start:p.end]
         last_a = None
+        turn_mids: set = set()
         for j, ac in enumerate(span):
             idx = p.start + j
             if ac.kind == "A":
                 last_a = ac.ts
-                p.cost += ac.cost
-                if ac.model:
+                if ac.mid not in turn_mids:
+                    turn_mids.add(ac.mid)
+                    p.cost += msg_cost.get(ac.mid, 0.0)
+                if ac.model and not ac.model.startswith("<"):
                     p.models.add(ac.model)
                 for n in ac.tool_uses:
                     p.tools[n] += 1
@@ -740,6 +854,9 @@ def analyze_session(path: Path, break_secs: float = DEFAULT_BREAK_SECS,
         first=first, last=last, buckets=total, by_date=dict(by_date),
         prompts=prompts, longest_tool=longest_tool, cost=cost, models=models,
         has_block_events=has_block_events,
+        agent_runs=len(runs),
+        agent_runtime=sum(e - s for s, e in agent_iv),
+        cost_agents=sum(c for _, _, c, _ in runs),
     )
 
 

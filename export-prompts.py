@@ -58,7 +58,8 @@ def prompt_json(p: L.Prompt) -> dict:
         "working_seconds": round(p.working_secs),
         "tool_calls": sum(p.tools.values()),
         "tools": dict(p.tools),
-        "cost_usd": round(p.cost, 4),
+        "cost_usd": round(p.cost + p.cost_agents, 4),
+        "cost_agents_usd": round(p.cost_agents, 4),
         "models": sorted(p.models),
         "interrupted": p.interrupted,
     }
@@ -76,7 +77,10 @@ def session_json(a: L.SessionAnalysis) -> dict:
         "started_local": L.fmt_local(a.first, True),
         "ended_local": L.fmt_local(a.last, True),
         "prompt_count": len(a.prompts),
-        "cost_usd": round(a.cost, 4),
+        "cost_usd": round(a.cost_total, 4),
+        "cost_main_usd": round(a.cost, 4),
+        "cost_agents_usd": round(a.cost_agents, 4),
+        "agent_runs": a.agent_runs,
         "models": dict(a.models),
         "time": {"wall": round(a.buckets.wall), **a.buckets.to_json()},
         "prompts": [prompt_json(p) for p in a.prompts],
@@ -101,8 +105,8 @@ def session_text(a: L.SessionAnalysis) -> str:
         calls = sum(p.tools.values())
         if calls:
             bits.append(f"{calls} tool call{'s' if calls != 1 else ''}")
-        if p.cost:
-            bits.append(f"${p.cost:.2f}")
+        if p.cost or p.cost_agents:
+            bits.append(f"${p.cost + p.cost_agents:.2f}")
         if p.interrupted:
             bits.append("interrupted")
         meta = f"  ({' · '.join(bits)})" if bits else ""
@@ -205,7 +209,7 @@ def main(argv=None) -> int:
             "project": meta,
             "session_count": len(analyses),
             "prompt_count": total_prompts,
-            "cost_usd": round(sum(a.cost for a in analyses), 4),
+            "cost_usd": round(sum(a.cost_total for a in analyses), 4),
             "sessions": [session_json(a) for a in analyses],
         }
         target = out_dir / (f"{L.session_start_stem(analyses[0])}.json" if args.session
