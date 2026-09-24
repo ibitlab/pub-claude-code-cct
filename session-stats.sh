@@ -13,6 +13,16 @@ set -euo pipefail
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 
 ROOT="$HOME/.claude/projects"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# Prices: pricing.json (the table) + pricing.jq (the helpers), shared by
+# every cost script. `priced` keeps one transcript line per API message —
+# Claude Code writes one line per content block, each repeating the whole
+# message's usage, so tokens, turns and cost would otherwise be counted
+# 2-3 times over.
+[[ -f "$HERE/pricing.json" && -f "$HERE/pricing.jq" ]] \
+  || { echo "pricing.json / pricing.jq missing next to $0" >&2; exit 1; }
+JQ_DEFS=$(jq -r '"def pricing: \(tojson);"' "$HERE/pricing.json"; cat "$HERE/pricing.jq")
 
 resolve_session() {
   # Accepts a full .jsonl path, a full UUID, or a unique UUID prefix.
@@ -61,24 +71,24 @@ if [[ -n "$FIRST" && -n "$LAST" ]]; then
 fi
 echo
 
-# Event-type breakdown
+# Event-type breakdown (raw transcript lines — an API message spans several)
 echo "events by type:"
 jq -r '.type' "$FILE" | sort | uniq -c | sort -rn | sed 's/^/  /'
 echo
 
-# Models used
+# Models used (per API message)
 echo "models:"
-jq -r 'select(.type=="assistant") | .message.model' "$FILE" | sort | uniq -c | sort -rn | sed 's/^/  /'
+jq -rs "$JQ_DEFS"'priced[] | .message.model' "$FILE" | sort | uniq -c | sort -rn | sed 's/^/  /'
 echo
 
-# Stop reasons
+# Stop reasons (per API message)
 echo "stop reasons:"
-jq -r 'select(.type=="assistant") | .message.stop_reason // "?"' "$FILE" | sort | uniq -c | sort -rn | sed 's/^/  /'
+jq -rs "$JQ_DEFS"'priced[] | .message.stop_reason // "?"' "$FILE" | sort | uniq -c | sort -rn | sed 's/^/  /'
 echo
 
 # Token usage totals (as JSON, used by both the display block and the cost block)
-TOTALS=$(jq -s '
-  [.[] | select(.type=="assistant") | .message.usage] as $u
+TOTALS=$(jq -s "$JQ_DEFS"'
+  [priced[] | .message.usage] as $u
   | {
       turns: ($u | length),
       input: ($u | map(.input_tokens // 0) | add),
@@ -108,27 +118,17 @@ echo "$TOTALS" | jq -r '
 echo
 
 # ---------- Cost estimate ----------
-# List prices in USD per 1M tokens, current as of 2026-09 (Claude 5 family).
-# Cache-write tiers: 5m = 1.25× input, 1h = 2× input. Cache-read = 0.1× input.
-# These are LIST prices — actual billing may differ (contract tiers, batch, etc).
-# Keep in sync with the jq pricing table in cost-report.sh.
+# LIST prices from pricing.json — actual billing may differ (contract tiers,
+# batch, etc).
 price_for_model() {
   # sets globals: P_IN P_OUT P_5M P_1H P_READ (USD per 1M tokens)
-  case "$1" in
-    claude-fable*|claude-mythos*)        P_IN=10.00; P_OUT=50.00; P_5M=12.50; P_1H=20.00; P_READ=1.00 ;;
-    claude-opus-5*|claude-opus-4-[5-9]*) P_IN=5.00;  P_OUT=25.00; P_5M=6.25;  P_1H=10.00; P_READ=0.50 ;;
-    claude-opus-*)                       P_IN=15.00; P_OUT=75.00; P_5M=18.75; P_1H=30.00; P_READ=1.50 ;;
-    claude-sonnet-5*)                    P_IN=2.00;  P_OUT=10.00; P_5M=2.50;  P_1H=4.00;  P_READ=0.20 ;;
-    claude-sonnet-*)                     P_IN=3.00;  P_OUT=15.00; P_5M=3.75;  P_1H=6.00;  P_READ=0.30 ;;
-    claude-haiku-5*|claude-haiku-4-[5-9]*) P_IN=1.00; P_OUT=5.00; P_5M=1.25;  P_1H=2.00;  P_READ=0.10 ;;
-    claude-haiku-*)                      P_IN=0.80;  P_OUT=4.00;  P_5M=1.00;  P_1H=1.60;  P_READ=0.08 ;;
-    *)                                   P_IN=5.00;  P_OUT=25.00; P_5M=6.25;  P_1H=10.00; P_READ=0.50 ;; # default: current Opus
-  esac
+  read -r P_IN P_OUT P_READ P_5M P_1H < <(
+    jq -rn --arg m "$1" "$JQ_DEFS"'price($m) | "\(.inp) \(.out) \(.rd) \(.c5) \(.c1)"')
 }
 
 # If the session used a single model, cost it against that model's rates.
 # If multiple, sum per-model by grouping assistant events.
-MODELS=$(jq -r 'select(.type=="assistant") | .message.model' "$FILE" | sort -u)
+MODELS=$(jq -rs "$JQ_DEFS"'priced[] | .message.model' "$FILE" | sort -u)
 MODEL_COUNT=$(echo "$MODELS" | grep -c .)
 
 echo "cost (estimate, list prices):"
@@ -163,8 +163,8 @@ else
   while IFS= read -r MODEL; do
     [[ -z "$MODEL" ]] && continue
     price_for_model "$MODEL"
-    SUBTOTALS=$(jq -rs --arg m "$MODEL" '
-      [.[] | select(.type=="assistant" and .message.model==$m) | .message.usage] as $u
+    SUBTOTALS=$(jq -rs --arg m "$MODEL" "$JQ_DEFS"'
+      [priced[] | select(.message.model==$m) | .message.usage] as $u
       | {
           input:     ($u | map(.input_tokens // 0) | add),
           output:    ($u | map(.output_tokens // 0) | add),

@@ -49,6 +49,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 STATE_FILE = Path.home() / ".cache" / "cct" / "state.json"
 
+# Shared transcript analysis (project discovery, merged groups, time model)
+# lives next to this file; the symlink in ~/.local/bin resolves to here.
+sys.path.insert(0, str(SCRIPT_DIR))
+import cct_lib as L  # noqa: E402
+
 # ---------- state ----------
 
 def load_state() -> dict:
@@ -116,11 +121,12 @@ def parse_jsonl(jsonl: Path) -> Session | None:
                 if t == "ai-title":
                     title = ev.get("aiTitle") or title
                 elif t == "last-prompt":
-                    # Each last-prompt event is a snapshot appended when the
-                    # user submits a new typed prompt → count = round trips.
-                    turns += 1
+                    # Each last-prompt event is a snapshot of the latest typed
+                    # prompt. Claude Code re-emits the same snapshot many times
+                    # per turn, so only a *changed* text is a new round trip.
                     p = ev.get("lastPrompt")
-                    if p:
+                    if p and p != last_prompt:
+                        turns += 1
                         if first_prompt is None:
                             first_prompt = p
                         last_prompt = p
@@ -167,9 +173,12 @@ def run_script(name: str, *args: str) -> str:
             sys.stdout.flush()
     except Exception:
         pass
+    # Python helpers run under the same interpreter as the TUI, so they do
+    # not depend on the exec bit or on which python3 is first on PATH.
+    cmd = [sys.executable, str(path), *args] if name.endswith(".py") else [str(path), *args]
     try:
         proc = subprocess.run(
-            [str(path), *args],
+            cmd,
             capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT,
         )
     except subprocess.TimeoutExpired as e:
@@ -652,8 +661,27 @@ ENTRY_ITEMS = [
     ("cost",     "Cost report (today / week / 30 days)"),
     ("monthly",  "Usage & cost by month  →"),
     ("projects", "Cost by project (with daily breakdown)  →"),
+    ("merged",   "Merged projects (old locations / split folders, counted together)  →"),
+    ("time",     "Time analytics (Claude working / tools / you — by project, by date)  →"),
+    ("export",   "Export prompts (text file per session, or one JSON)  →"),
     ("stack",    "Stack / tech used (today / week / 30 days)"),
     ("trouble",  "Troubleshooting / cleanup  →"),
+]
+
+GROUP_ITEMS = [
+    ("cost",     "Cost — daily breakdown (v: per model)"),
+    ("sessions", "Sessions of all folders together"),
+    ("time",     "Time analytics — by date (v: per session)"),
+    ("export",   "Export prompts"),
+    ("members",  "Folders — add / remove"),
+    ("rename",   "Rename"),
+    ("delete",   "Delete this merged project (transcripts are not touched)"),
+    ("back",     "Back"),
+]
+
+FORMAT_ITEMS = [
+    ("text", "Text — one file per session  (YYYY-MM-DD_HHMM_<id>.txt, prompts verbatim)"),
+    ("json", "JSON — everything in one file  (timestamps, reply time, tools, cost per prompt)"),
 ]
 
 TROUBLE_ITEMS = [
@@ -665,8 +693,10 @@ TROUBLE_ITEMS = [
 
 ACTION_ITEMS = [
     ("stats",      "Stats + cost"),
+    ("time",       "Time breakdown (Claude working / tools / you; v: per turn)"),
     ("tools",      "Tool usage"),
     ("questions",  "Your prompts (questions)"),
+    ("export",     "Export prompts of this session to a file"),
     ("back",       "Back to session picker"),
 ]
 
@@ -844,6 +874,349 @@ def projects_flow() -> None:
                 variant_names=("summary", "extended"),
             )
 
+# ---------- text input, project pickers ----------
+
+def _drain_stdin() -> None:
+    """Throw away typeahead left over from curses (a queued Enter would
+    otherwise accept the default of the next line prompt unread)."""
+    try:
+        import termios, select  # noqa: F401  (POSIX only)
+        fd = sys.stdin.fileno()
+        while select.select([fd], [], [], 0)[0]:
+            os.read(fd, 1)
+    except Exception:
+        pass
+
+def text_input(label: str, default: str) -> str | None:
+    """One line of plain (cooked-mode) input, used outside curses for names
+    and paths. Enter keeps `default`; Ctrl-C / Ctrl-D cancel → None."""
+    _drain_stdin()
+    try:
+        s = input(f"{label} [{default}]: ")
+    except (EOFError, KeyboardInterrupt):
+        sys.stdout.write("\n")
+        return None
+    s = s.strip()
+    return s or default
+
+def prompt_line(title: str, text: str, label: str, default: str) -> str | None:
+    """Clear the screen, show `text` under a banner, then ask one line."""
+    _paint(title, text + "\n")
+    return text_input(label, default)
+
+def _folder_label(p: L.Project) -> str:
+    gone = "  (gone)" if not p.alive else ""
+    return f"{p.sessions:>3} sess  {p.label}{gone}"
+
+def pick_folder(title: str, subtitle: str, projects: list[L.Project],
+                exclude: set[str]) -> L.Project | None:
+    items = [(p.slug, _folder_label(p)) for p in projects if p.slug not in exclude]
+    if not items:
+        render_output(title, "No more folders to pick from.\n")
+        return None
+    choice = menu(title, subtitle, items)
+    if choice is None:
+        return None
+    return next(p for p in projects if p.slug == choice)
+
+def group_lines(g: L.Group, by_slug: dict) -> str:
+    """One line per folder of a merged project; ★ marks the primary."""
+    out = []
+    for s in g.slugs:
+        p = by_slug.get(s)
+        mark = "★" if s == g.primary else "+"
+        if p is None:
+            out.append(f"  {mark} {s}  (folder missing)")
+        else:
+            gone = "  (gone)" if not p.alive else ""
+            out.append(f"  {mark} {p.label}{gone}  · {p.sessions} sess")
+    return "\n".join(out)
+
+def _persist_group(old_name: str, g: L.Group) -> None:
+    groups = L.load_groups()
+    groups = [g if x.name == old_name else x for x in groups]
+    if g not in groups:
+        groups.append(g)
+    L.save_groups(groups)
+
+def _safe_name(name: str) -> str:
+    return name.replace("/", "-").strip() or "export"
+
+# ---------- export ----------
+
+def export_run(args: list[str], name: str) -> None:
+    """Format menu → destination prompt → export-prompts.py → result screen."""
+    fmt = menu("cct · Export prompts · format", f"Exporting: {name}", FORMAT_ITEMS, default="text")
+    if fmt is None:
+        return
+    base = Path(os.environ.get("CCT_EXPORT_DIR") or (Path.home() / "cct-export"))
+    default_dir = str(base / _safe_name(name))
+    out = prompt_line(
+        "cct · Export prompts · destination",
+        f"Exporting: {name}\nFormat:    {'one JSON file' if fmt == 'json' else 'one text file per session'}\n\n"
+        "Where to write? Enter keeps the default, Ctrl-C cancels.\n"
+        "Existing files are never overwritten — the export stops and tells you if any are in the way.",
+        "Output directory", default_dir,
+    )
+    if out is None:
+        return
+    extra = ["--json"] if fmt == "json" else []
+    render_output(f"Export prompts · {name}",
+                  run_script("export-prompts.py", *args, "-o", out, *extra))
+
+def export_flow() -> None:
+    projects = L.discover_projects()
+    groups = L.load_groups()
+    items: list[tuple] = [(f"g:{g.name}", f"⊕ {g.name}  ({len(L.group_dirs(g))} folders)") for g in groups]
+    items += [(f"p:{p.slug}", _folder_label(p)) for p in projects]
+    if not items:
+        render_output("Export prompts", "No projects found under ~/.claude/projects/.\n")
+        return
+    last = None
+    while True:
+        choice = menu(
+            "cct · Export prompts",
+            "Pick a project (⊕ = merged project). Then choose the format and where to write.\n"
+            "Text: one file per session, prompts verbatim.  JSON: one file with per-prompt stats.",
+            items, default=last,
+        )
+        if choice is None:
+            return
+        last = choice
+        if choice.startswith("g:"):
+            export_run(["--merged", choice[2:]], choice[2:])
+        else:
+            p = next(p for p in projects if p.slug == choice[2:])
+            export_run([str(p.dir)], p.name)   # folder path: a slug starts with '-'
+
+# ---------- time analytics ----------
+
+def time_flow() -> None:
+    projects = L.discover_projects()
+    groups = L.load_groups()
+    items: list[tuple] = [("all", "All projects — accumulated time (v: by date)")]
+    if groups:
+        items.append(("merged", "Merged projects — accumulated time"))
+        items += [(f"g:{g.name}", f"⊕ {g.name}  ({len(L.group_dirs(g))} folders)") for g in groups]
+    items += [(f"p:{p.slug}", _folder_label(p)) for p in projects]
+    last = "all"
+    while True:
+        choice = menu(
+            "cct · Time analytics",
+            "Where the hours went: Claude working · tools running · waiting on you · you (reading, typing).\n"
+            "Pauses over 30 min are breaks, left out of active time; work without Claude is invisible here.\n"
+            "Pick a project for its daily trend.",
+            items, default=last,
+        )
+        if choice is None:
+            return
+        last = choice
+        if choice == "all":
+            render_output_refresh(
+                lambda v: "Time by date — all projects" if v else "Time by project",
+                lambda v: run_script("time-report.py", *(["--dates"] if v else [])),
+                variants=2, variant_names=("by project", "by date"),
+            )
+        elif choice == "merged":
+            render_output_refresh(
+                lambda v: "Time by merged project",
+                lambda v: run_script("time-report.py", "--merged"),
+            )
+        elif choice.startswith("g:"):
+            name = choice[2:]
+            render_output_refresh(
+                lambda v, n=name: f"Time {'per session' if v else 'by date'} — ⊕ {n}",
+                lambda v, n=name: run_script(
+                    "time-report.py", "--merged", "--sessions" if v else "--dates", n),
+                variants=2, variant_names=("by date", "per session"),
+            )
+        else:
+            p = next(p for p in projects if p.slug == choice[2:])
+            render_output_refresh(
+                lambda v, lbl=p.label: f"Time {'per session' if v else 'by date'} — {lbl}",
+                lambda v, d=str(p.dir): run_script(     # folder path: a slug starts with '-'
+                    "time-report.py", "--sessions" if v else "--dates", d),
+                variants=2, variant_names=("by date", "per session"),
+            )
+
+# ---------- merged projects ----------
+
+def new_group_wizard(projects: list[L.Project]) -> L.Group | None:
+    by_slug = {p.slug: p for p in projects}
+    primary = pick_folder(
+        "cct · New merged project",
+        "Step 1 of 2 — pick the PRIMARY folder: the project as it is today.\n"
+        "(gone) = an old location whose folder no longer exists on disk.  / filters the list.",
+        projects, exclude=set(),
+    )
+    if primary is None:
+        return None
+    members: list[str] = []
+    while True:
+        chosen = "\n".join(f"  + {by_slug[s].label}" for s in members) or "  (none yet)"
+        sub = (f"Step 2 of 2 — add the folders to count together with ★ {primary.label}\n"
+               f"{chosen}\n"
+               "Enter adds a folder; pick Done to save.  Esc cancels.")
+        items: list[tuple] = [("done", f"✓  Done — save with {len(members)} extra folder(s)")]
+        items += [(p.slug, _folder_label(p)) for p in projects
+                  if p.slug != primary.slug and p.slug not in members]
+        choice = menu("cct · New merged project", sub, items, default="done" if members else None)
+        if choice is None:
+            return None
+        if choice == "done":
+            if members:
+                break
+            render_output("Nothing to merge",
+                          "Add at least one more folder — a merged project of one folder\n"
+                          "is just the project itself (see Cost by project).\n")
+            continue
+        members.append(choice)
+    groups = L.load_groups()
+    taken = {g.name for g in groups}
+    base = primary.name
+    name, i = base, 2
+    while name in taken:
+        name, i = f"{base}-{i}", i + 1
+    typed = prompt_line(
+        "cct · New merged project · name",
+        f"Primary: {primary.label}\nFolders: {len(members) + 1}\n\nEnter keeps the suggested name.",
+        "Name", name,
+    )
+    if typed is None:
+        return None
+    typed = typed.strip().lstrip("-")   # a leading '-' would read as a CLI option
+    if not typed or typed in taken:
+        typed = name
+    g = L.Group(name=typed, primary=primary.slug, members=members)
+    groups.append(g)
+    L.save_groups(groups)
+    render_output("Merged project saved",
+                  f"⊕ {g.name}\n{group_lines(g, by_slug)}\n\n"
+                  f"Saved to {L.home_rel(str(L.MERGES_FILE))}.\n"
+                  "Cost, sessions, time and export for this merged project live under\n"
+                  "Merged projects → pick it. Plain per-folder views are unchanged.\n")
+    return g
+
+def edit_members(g: L.Group, projects: list[L.Project]) -> None:
+    by_slug = {p.slug: p for p in projects}
+    while True:
+        items: list[tuple] = [("add", "+  Add a folder…")]
+        for s in g.slugs:
+            p = by_slug.get(s)
+            lbl = (p.label + ("  (gone)" if not p.alive else "")) if p else f"{s}  (folder missing)"
+            if s == g.primary:
+                items.append((s, f"★ {lbl}   — primary"))
+            else:
+                items.append((s, f"+ {lbl}   — Enter removes"))
+        choice = menu(f"cct · ⊕ {g.name} · folders",
+                      "Enter on a folder removes it from the merged project (the primary stays).\n"
+                      "Esc when done.", items, default="add")
+        if choice is None:
+            return
+        if choice == "add":
+            p = pick_folder(f"cct · add a folder to ⊕ {g.name}",
+                            "Folders already in this merged project are hidden.\n"
+                            "(gone) = old location that no longer exists on disk.",
+                            projects, exclude=set(g.slugs))
+            if p is not None:
+                g.members.append(p.slug)
+                _persist_group(g.name, g)
+        elif choice == g.primary:
+            render_output("Primary folder",
+                          "The primary folder can't be removed. Delete this merged project and\n"
+                          "create a new one if you want a different primary.\n")
+        else:
+            g.members = [m for m in g.members if m != choice]
+            _persist_group(g.name, g)
+
+def group_menu(g: L.Group, projects: list[L.Project]) -> str | None:
+    """Actions for one merged project. Returns 'deleted' when it was removed."""
+    by_slug = {p.slug: p for p in projects}
+    default = "cost"
+    while True:
+        action = menu(f"cct · Merged project ⊕ {g.name}",
+                      group_lines(g, by_slug) + "\n", GROUP_ITEMS, default=default)
+        if action is None or action == "back":
+            return None
+        default = action
+        if action == "cost":
+            render_output_refresh(
+                lambda v, n=g.name: f"Daily cost — ⊕ {n}" + (" (extended)" if v else ""),
+                lambda v, n=g.name: run_script(
+                    "project-costs.sh", "--merged", "--dates", n, *(["-v"] if v else [])),
+                variants=2, variant_names=("summary", "extended"),
+            )
+        elif action == "sessions":
+            sessions: list[Session] = []
+            for d in L.group_dirs(g):
+                sessions.extend(sessions_in(d))
+            sessions.sort(key=lambda s: s.last or "", reverse=True)
+            do_session_flow(sessions, title=f"⊕ {g.name}", with_project=True)
+        elif action == "time":
+            render_output_refresh(
+                lambda v, n=g.name: f"Time {'per session' if v else 'by date'} — ⊕ {n}",
+                lambda v, n=g.name: run_script(
+                    "time-report.py", "--merged", "--sessions" if v else "--dates", n),
+                variants=2, variant_names=("by date", "per session"),
+            )
+        elif action == "export":
+            export_run(["--merged", g.name], g.name)
+        elif action == "members":
+            edit_members(g, projects)
+        elif action == "rename":
+            new = prompt_line(f"cct · rename ⊕ {g.name}",
+                              "Ctrl-C keeps the current name.", "New name", g.name)
+            new = new.strip().lstrip("-") if new else None
+            if new and new != g.name:
+                if any(x.name == new for x in L.load_groups()):
+                    render_output("Rename", f"A merged project named '{new}' already exists.\n")
+                else:
+                    old = g.name
+                    g.name = new
+                    _persist_group(old, g)
+        elif action == "delete":
+            sure = menu(f"cct · delete ⊕ {g.name}?",
+                        "Only the binding is removed. Transcripts under ~/.claude/projects/ are never touched.",
+                        [("no", "No, keep it"), ("yes", "Yes, delete this merged project")],
+                        default="no")
+            if sure == "yes":
+                L.save_groups([x for x in L.load_groups() if x.name != g.name])
+                return "deleted"
+
+def merged_flow() -> None:
+    projects = L.discover_projects(include_empty=True)
+    last = "new"
+    while True:
+        groups = L.load_groups()
+        items: list[tuple] = [("new", "+  New merged project…")]
+        if groups:
+            items.append(("summary", "All merged projects — cost summary (v: per folder)"))
+        items += [(f"g:{g.name}", f"⊕ {g.name}  ({len(L.group_dirs(g))} folders)") for g in groups]
+        choice = menu(
+            "cct · Merged projects",
+            "Count several folders as one project: a project that moved or was renamed (old location\n"
+            "+ new), or a repo opened from more than one subfolder. Bindings live in ~/.config/cct.\n"
+            "Cost by project / Sessions keep showing folders one by one; this menu shows them merged.",
+            items, default=last,
+        )
+        if choice is None:
+            return
+        last = choice
+        if choice == "new":
+            g = new_group_wizard(projects)
+            if g is not None:
+                last = f"g:{g.name}"
+        elif choice == "summary":
+            render_output_refresh(
+                lambda v: "Cost by merged project" + (" (per folder)" if v else ""),
+                lambda v: run_script("project-costs.sh", "--merged", *(["-v"] if v else [])),
+                variants=2, variant_names=("summary", "per folder"),
+            )
+        else:
+            g = next((x for x in groups if x.name == choice[2:]), None)
+            if g is not None and group_menu(g, projects) == "deleted":
+                last = "new"
+
 def do_session_flow(sessions: list[Session], title: str, with_project: bool):
     while True:
         picked = session_picker(sessions, title, with_project)
@@ -857,6 +1230,18 @@ def do_session_flow(sessions: list[Session], title: str, with_project: bool):
             if action == "stats":
                 render_output(f"Stats + cost · {label}",
                               run_script("session-stats.sh", picked.id))
+            elif action == "time":
+                render_output_refresh(
+                    lambda v, lbl=label: f"Time breakdown{' + per turn' if v else ''} · {lbl}",
+                    lambda v, sid=picked.id: run_script(
+                        "time-report.py", "--session", sid, *(["-v"] if v else [])
+                    ),
+                    variants=2,
+                    variant_names=("summary", "per turn"),
+                )
+            elif action == "export":
+                name = os.path.basename(picked.cwd.rstrip("/")) if picked.cwd else "session"
+                export_run(["--session", picked.id], name)
             elif action == "tools":
                 render_output_refresh(
                     lambda v, lbl=label: f"Tool usage{' + bash commands' if v else ''} · {lbl}",
@@ -870,7 +1255,7 @@ def do_session_flow(sessions: list[Session], title: str, with_project: bool):
                 render_output(f"Your prompts · {label}",
                               run_script("session-questions.sh", picked.id))
 
-CCT_VERSION = "0.4.0"
+CCT_VERSION = "0.5.0"
 
 HELP_TEXT = """\
 cct — interactive TUI for Claude Code session transcripts.
@@ -883,6 +1268,9 @@ Usage:
 Environment:
   CCT_PAGER       auto (default) | never   Control whether long outputs are
                   paged through `less -R`.
+  CCT_EXPORT_DIR  Where "Export prompts" writes (default ~/cct-export).
+  CCT_DAY_START   Hour at which a "day" starts in Time analytics (default 0;
+                  4 keeps a session that crosses midnight on one date).
 
 Inside the TUI:
   ↑/↓ or j/k       Move cursor.
@@ -892,17 +1280,29 @@ Inside the TUI:
   /                Filter the current list (picker only).
   Enter            Select / refresh a live view.
   v                Toggle short ↔ extended on views that have both
-                   (cost / stack / tool usage).
+                   (cost / stack / tool usage / time).
   ←/→ or [/]       Older / newer month in the by-month detail view.
   p                Page the current view through `less -R` (scroll back
                    within the view when output overflows the terminal).
   Esc, q, ⌫        Back one level.
   Ctrl-C           Quit from anywhere.
 
-Shell scripts invoked under the hood live next to this file and can be
-used standalone: list-sessions.sh, session-stats.sh, session-tools.sh,
+Menus:
+  Merged projects  Bind an old location (folder gone) or a split-off
+                   folder to a primary project; cost / sessions / time /
+                   export then count them together. Bindings are stored in
+                   ~/.config/cct/merges.json; per-folder views are unchanged.
+  Time analytics   Claude working / tools running / waiting on you / you,
+                   per project, per day, per session, per turn.
+  Export prompts   Your typed prompts, one text file per session
+                   (YYYY-MM-DD_HHMM_<id>.txt) or one JSON with per-prompt
+                   timestamps, reply time, tool calls and cost.
+
+Scripts invoked under the hood live next to this file and can be used
+standalone: list-sessions.sh, session-stats.sh, session-tools.sh,
 session-questions.sh, active-sessions.sh, cost-report.sh, project-costs.sh,
-stack-report.sh, dead-sessions.sh, status.sh.
+stack-report.sh, dead-sessions.sh, status.sh, time-report.py,
+export-prompts.py.
 """
 
 def main() -> int:
@@ -972,6 +1372,12 @@ def main() -> int:
                 monthly_flow()
             elif action == "projects":
                 projects_flow()
+            elif action == "merged":
+                merged_flow()
+            elif action == "time":
+                time_flow()
+            elif action == "export":
+                export_flow()
             elif action == "stack":
                 render_output_refresh(
                     lambda v: "Stack / tech used" + (" (extended)" if v else ""),

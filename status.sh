@@ -13,6 +13,13 @@ command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 
 ROOT="$HOME/.claude/projects"
 SESSIONS_DIR="$HOME/.claude/sessions"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# Prices: pricing.json (the table) + pricing.jq (the helpers), shared by
+# every cost script.
+[[ -f "$HERE/pricing.json" && -f "$HERE/pricing.jq" ]] \
+  || { echo "pricing.json / pricing.jq missing next to $0" >&2; exit 1; }
+JQ_DEFS=$(jq -r '"def pricing: \(tojson);"' "$HERE/pricing.json"; cat "$HERE/pricing.jq")
 
 # ---------- active sessions (live PIDs in ~/.claude/sessions/*.json) ----------
 
@@ -56,21 +63,7 @@ MONTH_ISO=$(to_utc_iso "$month_epoch")
 AGG=$(find "$ROOT" -maxdepth 2 -name "*.jsonl" -print0 2>/dev/null \
   | xargs -0 cat 2>/dev/null \
   | jq -sr --arg d "$TODAY_ISO" --arg y "$YESTERDAY_ISO" \
-           --arg w "$WEEK_ISO" --arg m "$MONTH_ISO" '
-    def price(mdl):
-      (mdl // "") as $m |
-      if   $m | startswith("claude-opus")   then {inp:15,   out:75, rd:1.5,  c5:18.75, c1:30}
-      elif $m | startswith("claude-sonnet") then {inp:3,    out:15, rd:0.3,  c5:3.75,  c1:6}
-      elif $m | startswith("claude-haiku")  then {inp:0.8,  out:4,  rd:0.08, c5:1,     c1:1.6}
-      else                                        {inp:15,   out:75, rd:1.5,  c5:18.75, c1:30}
-      end;
-    def cost_of(u; p):
-      ( (u.input_tokens               // 0) * p.inp
-      + (u.output_tokens              // 0) * p.out
-      + (u.cache_read_input_tokens    // 0) * p.rd
-      + (u.cache_creation.ephemeral_5m_input_tokens // 0) * p.c5
-      + (u.cache_creation.ephemeral_1h_input_tokens // 0) * p.c1
-      ) / 1e6;
+           --arg w "$WEEK_ISO" --arg m "$MONTH_ISO" "$JQ_DEFS"'
     # start..end_excl window; end_excl="" means open-ended (now).
     def window(start; end_excl; records):
       ([ records[]
@@ -80,8 +73,8 @@ AGG=$(find "$ROOT" -maxdepth 2 -name "*.jsonl" -print0 2>/dev/null \
           sessions: ([$ae[].sid] | unique | length),
           turns:    ([$ae[] | select(.end)] | length) };
 
-    [ .[]
-      | select(.type=="assistant" and .timestamp and .message.usage)
+    [ priced[]
+      | select(.timestamp)
       | { ts:   .timestamp,
           sid:  .sessionId,
           cost: cost_of(.message.usage; price(.message.model)),
@@ -148,5 +141,5 @@ echo
 # cleanup
 printf '  cleanup:  %2d dead project(s)           (cct → Troubleshooting → Dead projects)\n' "$dead"
 printf '            %2d stale session marker(s)' "$stale"
-[[ $stale -gt 0 ]] && printf "   (rm ~/.claude/sessions/*.json for gone PIDs)"
+[[ $stale -gt 0 ]] && printf "   (cct → Troubleshooting → Stale session markers)"
 echo

@@ -18,12 +18,19 @@ set -euo pipefail
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 
 ROOT="$HOME/.claude/projects"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 EXTENDED=0
 case "${1:-}" in
   -v|--extended) EXTENDED=1 ;;
   "") ;;
   *) echo "unknown option: $1" >&2; exit 1 ;;
 esac
+
+# Shared jq helpers (dedup_events): after /compact the transcript holds exact
+# copies of earlier lines, which would count every file touch again.
+[[ -f "$HERE/pricing.json" && -f "$HERE/pricing.jq" ]] \
+  || { echo "pricing.json / pricing.jq missing next to $0" >&2; exit 1; }
+JQ_DEFS=$(jq -r '"def pricing: \(tojson);"' "$HERE/pricing.json"; cat "$HERE/pricing.jq")
 
 # ---------- window start timestamps (UTC ISO 8601) ----------
 
@@ -51,7 +58,7 @@ MONTH_LABEL="$(date -r "$month_epoch" +%Y-%m-%d) → $today_local"
 AGG=$(find "$ROOT" -maxdepth 2 -name "*.jsonl" -print0 2>/dev/null \
   | xargs -0 cat 2>/dev/null \
   | jq -sr --arg d "$TODAY_ISO" --arg y "$YESTERDAY_ISO" \
-           --arg w "$WEEK_ISO" --arg m "$MONTH_ISO" '
+           --arg w "$WEEK_ISO" --arg m "$MONTH_ISO" "$JQ_DEFS"'
     # Basename of a path string (last "/"-delimited segment).
     def base: sub(".*/"; "");
     # Lowercased extension; "" if the basename has no dot.
@@ -104,10 +111,10 @@ AGG=$(find "$ROOT" -maxdepth 2 -name "*.jsonl" -print0 2>/dev/null \
        "proto": "Protobuf"
       }[$e] // null;
 
-    # One event per Read/Write/Edit tool_use with a file_path.
+    # One event per Read/Write/Edit tool_use with a file_path. Lines replayed
+    # after /compact are dropped first (same uuid → counted once).
     def events:
-      [ .[]
-        | select(.type=="assistant" and .timestamp)
+      [ ([ .[] | select(.type=="assistant" and .timestamp) ] | dedup_events)[]
         | .timestamp as $ts
         | (.message.content[]? | select(.type=="tool_use")) as $t
         | select($t.name == "Read" or $t.name == "Write" or $t.name == "Edit")

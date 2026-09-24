@@ -8,6 +8,11 @@
 #   ./project-costs.sh --dates <project> -v  # …with per-model daily breakdown
 #   ./project-costs.sh --list                # project roots, one per line (scripts/TUI)
 #
+#   ./project-costs.sh --merged                       # total cost per MERGED project
+#   ./project-costs.sh --merged -v                    # …with one row per member folder
+#   ./project-costs.sh --merged --dates <name> [-v]   # daily trend for a merged project
+#   ./project-costs.sh --merged --list                # merged project names, one per line
+#
 # What counts as one project
 # --------------------------
 # A project is one folder under ~/.claude/projects/ — i.e. the directory
@@ -28,20 +33,34 @@
 # <project> accepts that label (`~/…` or absolute) or any unambiguous trailing
 # segment of it; an ambiguous argument lists candidates and exits non-zero.
 #
-# Same list-price pricing as cost-report.sh. Estimates only.
+# Merged projects
+# ---------------
+# A project that moved or was renamed keeps its old transcripts under the old
+# folder; a repo opened from two subfolders gets two folders. `cct → Merged
+# projects` binds such folders to one primary and stores the bindings in
+# ~/.config/cct/merges.json ({"groups": [{"name", "primary", "members"}]},
+# slugs = folder names). --merged reports on those bindings, counted
+# together. Plain mode is untouched — merged projects are a separate view.
+#
+# Prices come from pricing.json next to this script (shared by every cost
+# script). Estimates only.
 
 set -euo pipefail
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 
 ROOT="$HOME/.claude/projects"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+MERGES_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/cct/merges.json"
 EXTENDED=0
 MODE=total
+MERGED=0
 PROJECT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -v|--extended) EXTENDED=1; shift ;;
     --list)        MODE=list; shift ;;
+    --merged)      MERGED=1; shift ;;
     --dates)
       MODE=dates
       PROJECT="${2:-}"
@@ -51,29 +70,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ---------- pricing (shared jq defs; keep in sync with cost-report.sh) ----------
-JQ_DEFS='
-    def price(mdl):
-      (mdl // "") as $m |
-      if   ($m | startswith("claude-fable")) or ($m | startswith("claude-mythos"))
-                                            then {inp:10,  out:50, rd:1,    c5:12.5,  c1:20}
-      elif $m | test("^claude-opus-(5|4-[5-9])")
-                                            then {inp:5,   out:25, rd:0.5,  c5:6.25,  c1:10}
-      elif $m | startswith("claude-opus")   then {inp:15,  out:75, rd:1.5,  c5:18.75, c1:30}
-      elif $m | test("^claude-sonnet-5")    then {inp:2,   out:10, rd:0.2,  c5:2.5,   c1:4}
-      elif $m | startswith("claude-sonnet") then {inp:3,   out:15, rd:0.3,  c5:3.75,  c1:6}
-      elif $m | test("^claude-haiku-(5|4-[5-9])")
-                                            then {inp:1,   out:5,  rd:0.1,  c5:1.25,  c1:2}
-      elif $m | startswith("claude-haiku")  then {inp:0.8, out:4,  rd:0.08, c5:1,     c1:1.6}
-      else                                       {inp:5,   out:25, rd:0.5,  c5:6.25,  c1:10}
-      end;
-    def cost_of(u; p):
-      ( (u.input_tokens               // 0) * p.inp
-      + (u.output_tokens              // 0) * p.out
-      + (u.cache_read_input_tokens    // 0) * p.rd
-      + (u.cache_creation.ephemeral_5m_input_tokens // 0) * p.c5
-      + (u.cache_creation.ephemeral_1h_input_tokens // 0) * p.c1
-      ) / 1e6;
+# ---------- pricing (shared: pricing.json = the table, pricing.jq = the helpers) ----------
+[[ -f "$HERE/pricing.json" && -f "$HERE/pricing.jq" ]] \
+  || { echo "pricing.json / pricing.jq missing next to $0" >&2; exit 1; }
+JQ_DEFS=$(jq -r '"def pricing: \(tojson);"' "$HERE/pricing.json"; cat "$HERE/pricing.jq")
+# Script-specific helpers on top of the shared ones.
+JQ_DEFS+='
     # Home-relative display form: /Users/me/projects/foo → ~/projects/foo
     def shorten($home): if $home != "" and startswith($home + "/")
                         then "~" + .[($home | length):] else . end;
@@ -115,20 +117,25 @@ pad_chars() {
   printf '%s%*s' "$s" "$p" ""
 }
 
-# One TSV row per project: cost \t root \t sessions \t by_model-json \t dir
-# Sorted by cost, descending. Projects with no priced events are skipped.
-# jq runs once per project folder, which is what keeps each folder's events
-# attributable — a single concatenated pass would lose that provenance.
-project_rows() {
-  local pdir
-  for pdir in "$ROOT"/*/; do
-    set -- "$pdir"*.jsonl
-    [[ -e "$1" ]] || continue
-    cat "$@" 2>/dev/null | jq -sr --arg dir "$pdir" "$JQ_DEFS"'
-      ($dir | rtrimstr("/") | split("/") | last) as $fallback
-      | project_root($fallback) as $root
-      | [ .[]
-          | select(.type=="assistant" and .message.usage)
+# Concatenate the transcripts of one or more project folders.
+cat_dirs() {
+  local d
+  for d in "$@"; do
+    cat "$d"/*.jsonl 2>/dev/null || true
+  done
+}
+
+# One TSV row for a set of folders under one label:
+#   cost \t label \t sessions \t by_model-json
+# An empty label means "the opened folder" (shortest cwd), as in plain mode.
+# Prints nothing when the folders hold no priced events.
+rows_for_dirs() {
+  local label="$1"; shift
+  local fallback
+  fallback=$(basename "$1")
+  cat_dirs "$@" | jq -sr --arg label "$label" --arg fallback "$fallback" "$JQ_DEFS"'
+      (if $label == "" then project_root($fallback) else $label end) as $root
+      | [ priced[]
           | { sid:   .sessionId,
               model: (.message.model // "unknown"),
               cost:  cost_of(.message.usage; price(.message.model)) } ] as $a
@@ -140,12 +147,206 @@ project_rows() {
           , ( $a | group_by(.model)
                  | map({model: .[0].model, cost: ([.[].cost] | add)})
                  | map(select(.cost > 0)) | sort_by(-.cost) | tojson )
-          , $dir
           ] | @tsv
         end
     '
+}
+
+# One TSV row per project folder: cost \t root \t sessions \t by_model-json \t dir
+# Sorted by cost, descending. Folders with no priced events are skipped.
+# jq runs once per folder, which is what keeps each folder's events
+# attributable — a single concatenated pass would lose that provenance.
+project_rows() {
+  local pdir row
+  for pdir in "$ROOT"/*/; do
+    row=$(rows_for_dirs "" "${pdir%/}")
+    if [[ -n "$row" ]]; then
+      printf '%s\t%s\n' "$row" "${pdir%/}"
+    fi
   done | sort -t$'\t' -k1,1 -rn
 }
+
+# ---------- merged projects ----------
+
+# name \t slug \t slug…  (primary first), one line per merged project.
+group_lines() {
+  [[ -f "$MERGES_FILE" ]] || return 0
+  jq -r '.groups[]? | select(.primary) | .primary as $p
+         | [ (.name // $p), $p, (.members[]? | select(. != $p)) ] | @tsv' "$MERGES_FILE"
+}
+
+# Existing folders for a list of slugs → GROUP_DIRS (folders that vanished
+# from ~/.claude/projects are skipped, e.g. after a manual cleanup).
+group_dirs() {
+  GROUP_DIRS=()
+  local s
+  for s in "$@"; do
+    [[ -d "$ROOT/$s" ]] && GROUP_DIRS+=("$ROOT/$s")
+  done
+  return 0
+}
+
+# Resolve a merged project by exact name, else by a unique case-insensitive
+# substring. Prints "name \t slug \t slug…"; lists candidates and fails otherwise.
+find_group() {
+  local q="$1"
+  [[ -f "$MERGES_FILE" ]] || { echo "No merged projects defined ($MERGES_FILE)" >&2; return 1; }
+  jq -r --arg q "$q" '
+    [ .groups[]? | select(.primary) | .primary as $p
+      | { name: (.name // $p), slugs: ([$p] + [ .members[]? | select(. != $p) ]) } ] as $g
+    | ([ $g[] | select(.name == $q) ]) as $exact
+    | ([ $g[] | select(.name | ascii_downcase | contains($q | ascii_downcase)) ]) as $sub
+    | (if ($exact | length) == 1 then $exact else $sub end) as $hit
+    | if ($hit | length) == 1 then ($hit[0] | [.name] + .slugs | @tsv)
+      elif ($hit | length) == 0 then
+        ("Merged project not found: \($q)\nKnown merged projects:\n"
+         + ([ $g[].name ] | map("  " + .) | join("\n")) + "\n") | halt_error(1)
+      else
+        ("Ambiguous merged project: \($q)\nMatches:\n"
+         + ([ $hit[].name ] | map("  " + .) | join("\n")) + "\n") | halt_error(1)
+      end
+  ' "$MERGES_FILE"
+}
+
+# cost \t name \t sessions \t by_model-json \t folders   — one row per group.
+merged_rows() {
+  local f row
+  while IFS=$'\t' read -r -a f; do
+    (( ${#f[@]} >= 2 )) || continue
+    group_dirs "${f[@]:1}"
+    (( ${#GROUP_DIRS[@]} )) || continue
+    row=$(rows_for_dirs "${f[0]}" "${GROUP_DIRS[@]}")
+    if [[ -n "$row" ]]; then
+      printf '%s\t%s\n' "$row" "${#GROUP_DIRS[@]}"
+    fi
+  done < <(group_lines) | sort -t$'\t' -k1,1 -rn
+}
+
+# ---------- daily trend ----------
+
+print_daily() {
+  local label="$1"; shift
+  # Local UTC offset — buckets UTC timestamps into local calendar days.
+  local OFF DAILY
+  OFF=$(date +%z | awk '{ s = (substr($0,1,1)=="-") ? -1 : 1
+                          print s * (substr($0,2,2)*3600 + substr($0,4,2)*60) }')
+
+  DAILY=$(cat_dirs "$@" | jq -sr --argjson off "$OFF" "$JQ_DEFS"'
+      [ priced[]
+        | select(.timestamp)
+        | { dt: (.timestamp
+                 | (try (sub("\\.[0-9]+Z$"; "Z")
+                         | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime + $off
+                         | strftime("%Y-%m-%d"))
+                    catch .[0:10])),
+            sid:   .sessionId,
+            model: (.message.model // "unknown"),
+            cost:  cost_of(.message.usage; price(.message.model)) }
+      ]
+      | group_by(.dt)
+      | map({ dt: .[0].dt,
+              cost:     ([.[].cost] | add // 0),
+              sessions: ([.[].sid] | unique | length),
+              by_model: (group_by(.model)
+                         | map({model: .[0].model, cost: ([.[].cost] | add)})
+                         | map(select(.cost > 0))
+                         | sort_by(-.cost)) })
+      | sort_by(.dt) | reverse | .[]
+      | ( "D|\(.dt)|\(.sessions)|\(.cost)"
+        , (.by_model[] | "S|\(.model)|\(.cost)") )
+    ')
+
+  printf 'Daily cost — %s\n' "$label"
+  printf '%s\n' "=================================================="
+  printf '\n'
+
+  if [[ -z "$DAILY" ]]; then
+    printf '  (no usage recorded)\n'
+  else
+    local TOTAL=0 kind a b c color
+    while IFS='|' read -r kind a b c; do
+      if [[ "$kind" == D ]]; then
+        printf '%-12s  %3s sessions   $%8.2f\n' "$a" "$b" "$c"
+        TOTAL=$(awk -v x="$TOTAL" -v y="$c" 'BEGIN{printf "%.4f", x+y}')
+      elif [[ "$kind" == S && $EXTENDED -eq 1 ]]; then
+        color=$(color_for "$a")
+        printf '  %s%-42s $%8.2f%s\n' "$color" "$a" "$b" "$RST"
+      fi
+    done <<< "$DAILY"
+    printf '\n'
+    printf '%-12s %16s $%8.2f\n' "total" "" "$TOTAL"
+  fi
+  printf '\n'
+  printf '  (list prices; subscription plans pay the plan, not this amount)\n'
+}
+
+# ==================================================================
+# Merged-project modes
+# ==================================================================
+if [[ $MERGED -eq 1 ]]; then
+  if [[ "$MODE" == list ]]; then
+    group_lines | cut -f1
+    exit 0
+  fi
+
+  if [[ "$MODE" == dates ]]; then
+    LINE=$(find_group "$PROJECT") || exit 1
+    IFS=$'\t' read -r -a F <<< "$LINE"
+    group_dirs "${F[@]:1}"
+    (( ${#GROUP_DIRS[@]} )) || { echo "No folders of '${F[0]}' exist under $ROOT" >&2; exit 1; }
+    print_daily "⊕ ${F[0]}  (${#GROUP_DIRS[@]} folders)" "${GROUP_DIRS[@]}"
+    exit 0
+  fi
+
+  ROWS=$(merged_rows)
+
+  printf '%s\n' "Cost by merged project (estimate at list prices)"
+  printf '%s\n' "=================================================="
+  printf '\n'
+
+  if [[ -z "$ROWS" ]]; then
+    if [[ -f "$MERGES_FILE" ]]; then
+      printf '  (no usage recorded for any merged project)\n'
+    else
+      printf '  (no merged projects yet — cct → Merged projects → New merged project)\n'
+    fi
+  else
+    TOTAL=0
+    while IFS=$'\t' read -r cost name sessions _models nfold; do
+      label="⊕ $name  ($nfold folders)"
+      n=${#label}
+      (( n > 44 )) && label="…${label: n-43}"
+      printf '%s %3s sess   $%8.2f\n' "$(pad_chars "$label" 44)" "$sessions" "$cost"
+      TOTAL=$(awk -v x="$TOTAL" -v y="$cost" 'BEGIN{printf "%.4f", x+y}')
+      if [[ $EXTENDED -eq 1 ]]; then
+        LINE=$(find_group "$name") || continue
+        IFS=$'\t' read -r -a F <<< "$LINE"
+        for s in "${F[@]:1}"; do
+          if [[ ! -d "$ROOT/$s" ]]; then
+            printf '  %s\n' "$(pad_chars "$s" 42)  (folder missing)"
+            continue
+          fi
+          row=$(rows_for_dirs "" "$ROOT/$s")
+          if [[ -z "$row" ]]; then
+            printf '  %s   0 sess   $%8.2f\n' "$(pad_chars "$s" 42)" 0
+            continue
+          fi
+          IFS=$'\t' read -r mcost mroot msess _mm <<< "$row"
+          mlabel=$(printf '%s' "$mroot" | sed "s|^$HOME|~|")
+          [[ -d "$mroot" ]] || mlabel="$mlabel (gone)"
+          n=${#mlabel}
+          (( n > 42 )) && mlabel="…${mlabel: n-41}"
+          printf '  %s %3s sess   $%8.2f\n' "$(pad_chars "$mlabel" 42)" "$msess" "$mcost"
+        done
+      fi
+    done <<< "$ROWS"
+    printf '\n'
+    printf '%-44s %3s        $%8.2f\n' "total" "" "$TOTAL"
+  fi
+  printf '\n'
+  printf '  (list prices; subscription plans pay the plan, not this amount)\n'
+  exit 0
+fi
 
 # ==================================================================
 # Mode: machine-readable project list (roots, cost-sorted)
@@ -192,59 +393,7 @@ if [[ "$MODE" == dates ]]; then
 
   LABEL=$(cut -f2 <<< "$HITS" | sed "s|^$HOME|~|")
   PDIR=$(cut -f5 <<< "$HITS")
-
-  # Local UTC offset — buckets UTC timestamps into local calendar days.
-  OFF=$(date +%z | awk '{ s = (substr($0,1,1)=="-") ? -1 : 1
-                          print s * (substr($0,2,2)*3600 + substr($0,4,2)*60) }')
-
-  DAILY=$(cat "$PDIR"*.jsonl 2>/dev/null \
-    | jq -sr --argjson off "$OFF" "$JQ_DEFS"'
-      [ .[]
-        | select(.type=="assistant" and .timestamp and .message.usage)
-        | { dt: (.timestamp
-                 | (try (sub("\\.[0-9]+Z$"; "Z")
-                         | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime + $off
-                         | strftime("%Y-%m-%d"))
-                    catch .[0:10])),
-            sid:   .sessionId,
-            model: (.message.model // "unknown"),
-            cost:  cost_of(.message.usage; price(.message.model)) }
-      ]
-      | group_by(.dt)
-      | map({ dt: .[0].dt,
-              cost:     ([.[].cost] | add // 0),
-              sessions: ([.[].sid] | unique | length),
-              by_model: (group_by(.model)
-                         | map({model: .[0].model, cost: ([.[].cost] | add)})
-                         | map(select(.cost > 0))
-                         | sort_by(-.cost)) })
-      | sort_by(.dt) | reverse | .[]
-      | ( "D|\(.dt)|\(.sessions)|\(.cost)"
-        , (.by_model[] | "S|\(.model)|\(.cost)") )
-    ')
-
-  printf 'Daily cost — %s\n' "$LABEL"
-  printf '%s\n' "=================================================="
-  printf '\n'
-
-  if [[ -z "$DAILY" ]]; then
-    printf '  (no usage recorded)\n'
-  else
-    TOTAL=0
-    while IFS='|' read -r kind a b c; do
-      if [[ "$kind" == D ]]; then
-        printf '%-12s  %3s sessions   $%8.2f\n' "$a" "$b" "$c"
-        TOTAL=$(awk -v x="$TOTAL" -v y="$c" 'BEGIN{printf "%.4f", x+y}')
-      elif [[ "$kind" == S && $EXTENDED -eq 1 ]]; then
-        color=$(color_for "$a")
-        printf '  %s%-42s $%8.2f%s\n' "$color" "$a" "$b" "$RST"
-      fi
-    done <<< "$DAILY"
-    printf '\n'
-    printf '%-12s %16s $%8.2f\n' "total" "" "$TOTAL"
-  fi
-  printf '\n'
-  printf '  (list prices; subscription plans pay the plan, not this amount)\n'
+  print_daily "$LABEL" "$PDIR"
   exit 0
 fi
 

@@ -1,0 +1,21 @@
+{
+  "_about": [
+    "The ONE place where cct's prices live. USD per 1M tokens, public list",
+    "prices as of 2026-09. Every cost script (bash + jq) and cct_lib.py reads",
+    "this file; nothing else needs editing when prices change.",
+    "Rules are tried top to bottom; `match` is a regex applied to the model id",
+    "(jq `test` / Python `re.search`); the first hit wins. The last rule has an",
+    "empty regex and is the fallback for unknown model ids.",
+    "Cache columns: read = 0.1x input, 5m write = 1.25x input, 1h write = 2x input."
+  ],
+  "rules": [
+    { "family": "Fable 5 / Mythos 5",     "match": "^claude-(fable|mythos)",     "input": 10,  "output": 50, "cache_read": 1,    "cache_5m": 12.5,  "cache_1h": 20 },
+    { "family": "Opus 5, 4.8-4.5",        "match": "^claude-opus-(5|4-[5-9])",   "input": 5,   "output": 25, "cache_read": 0.5,  "cache_5m": 6.25,  "cache_1h": 10 },
+    { "family": "Opus 4.1 and older",     "match": "^claude-opus",               "input": 15,  "output": 75, "cache_read": 1.5,  "cache_5m": 18.75, "cache_1h": 30 },
+    { "family": "Sonnet 5",               "match": "^claude-sonnet-5",           "input": 2,   "output": 10, "cache_read": 0.2,  "cache_5m": 2.5,   "cache_1h": 4 },
+    { "family": "Sonnet 4.6 and older",   "match": "^claude-sonnet",             "input": 3,   "output": 15, "cache_read": 0.3,  "cache_5m": 3.75,  "cache_1h": 6 },
+    { "family": "Haiku 4.5",              "match": "^claude-haiku-(5|4-[5-9])",  "input": 1,   "output": 5,  "cache_read": 0.1,  "cache_5m": 1.25,  "cache_1h": 2 },
+    { "family": "Haiku 4 and older",      "match": "^claude-haiku",              "input": 0.8, "output": 4,  "cache_read": 0.08, "cache_5m": 1,     "cache_1h": 1.6 },
+    { "family": "unknown model (priced as current Opus)", "match": "",           "input": 5,   "output": 25, "cache_read": 0.5,  "cache_5m": 6.25,  "cache_1h": 10 }
+  ]
+}

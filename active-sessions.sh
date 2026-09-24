@@ -211,8 +211,8 @@ if [[ $STALE_ONLY -eq 1 ]]; then
   if (( stale_count == 0 )); then
     echo "  OK — no stale markers. ($alive_count live session(s) in ~/.claude/sessions/)"
   else
-    echo "Leftover marker files whose Claude Code process no longer exists."
-    echo "Safe to delete — Claude Code ignores stale markers on next scan."
+    echo "Leftover marker files in ~/.claude/sessions/ whose Claude Code process no"
+    echo "longer exists. Claude Code ignores them; cct only lists them."
     echo
     for r in "${stale_rows[@]}"; do
       printf '  %s\n' "$r"
@@ -220,11 +220,6 @@ if [[ $STALE_ONLY -eq 1 ]]; then
     echo
     printf 'summary: %d stale marker(s)  (%d live session(s) still running)\n' \
       "$stale_count" "$alive_count"
-    echo
-    echo 'To delete them all at once:'
-    echo '  for f in ~/.claude/sessions/*.json; do'
-    echo '    pid=$(jq -r .pid "$f"); kill -0 "$pid" 2>/dev/null || rm -f "$f"'
-    echo '  done'
   fi
   exit 0
 fi
@@ -278,7 +273,7 @@ fi
 
 if [[ $VERBOSE -eq 1 && $stale_count -gt 0 ]]; then
   echo
-  echo "Stale markers (process no longer running — safe to delete):"
+  echo "Stale markers (process no longer running):"
   for r in "${stale_rows[@]}"; do
     printf '  %s\n' "$r"
   done

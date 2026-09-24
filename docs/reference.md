@@ -7,7 +7,7 @@ quick tour, see the [README](../README.md).
 
 `cct` is an arrow-key TUI that wraps every script in this folder so you never type session UUIDs or paths. Pure Python standard library (`curses`) — no pip install.
 
-Flow: **entry menu** → pick scope → **session picker** (arrow keys) → **action menu** (stats / tools / bash commands) → inline output → Esc climbs back. State (last-used menu choice) persists in `~/.cache/cct/state.json` (mode `0600`).
+Flow: **entry menu** → pick scope → **session picker** (arrow keys) → **action menu** (stats / time / tools / prompts / export) → inline output → Esc climbs back. State (last-used menu choice) persists in `~/.cache/cct/state.json` (mode `0600`); merged-project bindings in `~/.config/cct/merges.json` (see [Merged projects](#merged-projects)).
 
 Keys: Up/Down or j/k, PgUp/PgDn, Home/End, Enter selects, Esc or q goes back, Ctrl-C quits. In the **Usage & cost by month** detail view, ←/→ (or `[`/`]`) step to the older/newer month without going back to the picker.
 
@@ -53,11 +53,17 @@ A few useful specialized event types:
 - **`last-prompt`** — `{lastPrompt: "..."}`: the most recent _typed_ user input at that point. Each new user message appends a new `last-prompt` event, so iterating in order gives you the verbatim sequence of user prompts — slash-command wrappers, tool results, and system reminders are **not** here.
 - **`file-history-snapshot`** — capture of a file's pre-edit contents, for local undo.
 
+Two traps worth knowing before you write your own pipeline:
+
+- **One API message = several `assistant` lines.** Claude Code writes one line per content block (thinking, text, each `tool_use`), all sharing the same `message.id` (newer versions also carry `apiBlockIndex`), and **every line repeats the whole message's `usage`**. Summing usage over lines overcounts tokens and cost 2–3×. All cct cost scripts keep one line per `message.id` (`msg_id` / `priced` in the jq defs).
+- **`last-prompt` is a clipped snapshot.** `lastPrompt` is cut at 200 characters (then `…`), has newlines flattened, and the same snapshot is re-emitted many times per turn. The verbatim text lives in the timestamped `user` event a few lines earlier, as its own text block next to wrapper blocks (`<ide_selection>`, `<ide_opened_file>`, …); that is where `export-prompts.py` takes it from.
+- **After `/compact` the history is written again.** Each compaction re-appends the earlier `user`/`assistant` lines as exact copies — same `uuid`, same `timestamp` — so a long session can hold every event three or four times. Anything that counts events (tool calls, file touches, time between events) must keep the first line per `uuid`; cct does (`dedup_events` in `pricing.jq`, the same rule in `cct_lib.py`). Cost is already safe because it keeps one line per `message.id`.
+
 Since it's append-only JSONL, any `jq` / `awk` pipeline works against it.
 
 ## Scripts
 
-All scripts require `jq` and read only from `~/.claude/` — nothing is written or deleted.
+The bash scripts require `jq`; `time-report.py` and `export-prompts.py` need only `python3` (they share `cct_lib.py` with the TUI). All of them read only from `~/.claude/` — nothing there is written or deleted. The only files cct writes are its own: `~/.cache/cct/state.json`, `~/.config/cct/merges.json`, and whatever you export.
 
 ### `status.sh`
 
@@ -69,7 +75,7 @@ One-screen overview, rolled up from the other scripts: active sessions (count + 
 
 ### `active-sessions.sh`
 
-Lists the Claude Code sessions running *right now*. Each live `claude` process drops a marker at `~/.claude/sessions/<PID>.json`; the script keeps the markers whose PID is still alive and joins them against the transcript to show project, session id, title and recent activity.
+Lists the Claude Code sessions running *right now*. Each live `claude` process drops a marker at `~/.claude/sessions/<PID>.json`; the script keeps the markers whose PID is still alive and joins them against the transcript to show project, session id, title and recent activity. Markers whose process is gone are only listed — cct never deletes anything under `~/.claude/`.
 
 ```bash
 ./active-sessions.sh              # one row per live session
@@ -168,7 +174,7 @@ cost (estimate, list prices):
 
 #### Cost model
 
-Prices are list USD per 1M tokens (as of 2026-09), hard-coded in the script (cache write 5m = 1.25× input, 1h = 2× input, cache read = 0.1× input):
+Prices are list USD per 1M tokens (as of 2026-09) and live in **one file, `pricing.json`**, read by every cost script and by `cct_lib.py`; `pricing.jq` holds the shared jq helpers (`price`, `cost_of`, `priced`) that use it. Each rule is a regex on the model id, tried top to bottom; the last rule (empty regex) prices unknown models. To change prices, edit `pricing.json` only (cache write 5m = 1.25× input, 1h = 2× input, cache read = 0.1× input):
 
 | Family                    | Input | Output | Cache write 5m | Cache write 1h | Cache read |
 | ------------------------- | ----- | ------ | -------------- | -------------- | ---------- |
@@ -186,7 +192,7 @@ If a session used multiple models, cost is split and summed per model. Actual bi
 
 ### `session-tools.sh`
 
-Tool-usage report for one session: per-tool call counts, files read / written / edited, grep patterns, glob patterns, web-fetch URLs, and bash command count. Pass `--commands` to also list every bash command the session ran.
+Tool-usage report for one session: per-tool call counts, files read / written / edited, grep patterns, glob patterns, web-fetch URLs, and bash command count. Pass `--commands` to also list every bash command the session ran. Lines replayed after `/compact` are counted once.
 
 ```bash
 ./session-tools.sh 5d35e607
@@ -285,6 +291,11 @@ Aggregates estimated token cost by project, with an optional per-day breakdown f
 ./project-costs.sh --dates <project>        # daily cost trend for one project
 ./project-costs.sh --dates <project> -v     # …with per-model daily breakdown
 ./project-costs.sh --list                   # project roots, one per line (scripts/TUI)
+
+./project-costs.sh --merged                 # total cost per merged project
+./project-costs.sh --merged -v              # …with one row per member folder
+./project-costs.sh --merged --dates <name>  # daily trend for a merged project (-v: per model)
+./project-costs.sh --merged --list          # merged project names, one per line
 ```
 
 Example output:
@@ -314,6 +325,165 @@ A project is **one folder under `~/.claude/projects/`** — the directory Claude
 Each project is labelled with the shortest `cwd` recorded inside it, which is the folder that was opened. Long paths are clipped from the left, keeping the distinctive tail.
 
 In the TUI, **Cost by project** ranks all projects by total cost; pick one to see its daily trend. `v` toggles the per-model breakdown in either view.
+
+#### Merged projects
+
+Sometimes one folder per project is the wrong unit the other way round: a project that moved or was renamed keeps its old transcripts under the old slug (the folder is *dead*, but the history is real), and a repo you opened from two subfolders shows up as two projects. A **merged project** binds such folders to one *primary* (the project as it is today) so they are counted together. Nothing under `~/.claude/projects/` is touched; the plain per-folder views keep working unchanged.
+
+Bindings live in `~/.config/cct/merges.json` (`$XDG_CONFIG_HOME` is honoured):
+
+```json
+{
+  "version": 1,
+  "groups": [
+    { "name": "webapp",
+      "primary": "-Users-me-code-webapp",
+      "members": [ "-Users-me-old-code-webapp",
+                   "-Users-me-code-webapp-tools" ] }
+  ]
+}
+```
+
+`primary` and `members` are slugs — folder names under `~/.claude/projects/`. Members that no longer exist there are skipped. Edit the file by hand or use the TUI: **Merged projects → New merged project** walks you through picking the primary and adding folders (dead ones are listed as *(gone)*); each merged project then has cost (summary + daily), sessions across all folders, time analytics, export, add/remove folders, rename and delete (which removes only that entry from the file). `uninstall.sh` leaves the file in place and tells you where it is.
+
+`<name>` matches a merged project exactly, or by a unique case-insensitive substring.
+
+### `time-report.py`
+
+Where the hours went. Only timestamped `user`/`assistant` events on the main thread count; every gap between two consecutive ones is attributed to whoever was busy during it, decided by the event that *ends* the gap:
+
+| Gap ends in | Bucket | Meaning |
+| --- | --- | --- |
+| assistant output | **claude working** | generating, including thinking (reported separately when the transcript has per-block lines) |
+| a tool result | **tools running** | tool execution, including the permission dialog in front of it. `AskUserQuestion`, `ExitPlanMode` and declined calls go to *waiting* instead. An instant tool (Read, Edit, Glob, …) that took longer than `--approve-secs` (15) is flagged as a likely permission prompt |
+| a typed prompt | **you** | Claude was done, you were reading or typing. A prompt you answered with Esc while a tool call was pending counts as *waiting* |
+
+Any gap longer than `--break-min` (30) that was waiting on a person — an idle gap, a question, a pending tool call — is a **break** and leaves active time: a permission dialog left open overnight is not tool time. (A tool that genuinely ran longer than the threshold lands there too; rare, and the threshold is yours to set.) Only Claude's own generation is never capped.
+
+`active = working + tools + waiting + you`; `wall = active + breaks`. Sub-agent work runs inside the Agent tool's gap and is not separated out. Lines replayed after `/compact` are ignored (first line per `uuid`). A gap is attributed to the local calendar date it starts on — a session that crosses midnight is split between the two dates. If you would rather count a day from a later hour, `--day-start H` (or `CCT_DAY_START=H`) does that; it is off by default.
+
+#### Columns
+
+The by-project, by-date and per-session tables share these columns. Durations print as `12h03m`, `3m12s` or `12s`.
+
+| Column | What it counts |
+| --- | --- |
+| `sess` | Sessions that contributed to the row. In the by-date table a session that spans two dates counts on both, so the `total` row shows *distinct* sessions rather than the column sum. |
+| `active` | `working + tools + waiting + you`. Everything except breaks — the time somebody (Claude, a tool, or you) was actually busy in the session. |
+| `working` | Gaps that end in Claude's output: from your prompt to its first block, between its blocks, from a tool result to its next block. Thinking is inside this number; the single-session view breaks it out as *of which thinking* when the transcript has per-block lines. Never capped — Claude does not take breaks. |
+| `tools` | Gaps that end in a tool result: the tool running, plus the permission dialog in front of it, which the transcript cannot tell apart. Instant tools (Read, Edit, Write, Glob, Grep, …) slower than `--approve-secs` are counted here but flagged as *likely permission prompts* in the single-session view. |
+| `waiting` | Claude blocked on you: `AskUserQuestion`, `ExitPlanMode` (plan approval), a tool call you declined, or a permission prompt you left with Esc. |
+| `you` | Gaps that end in your next typed prompt after Claude finished: reading the answer, thinking, typing, poking around the IDE. |
+| `breaks` | Any gap longer than `--break-min` (30) that was waiting on a person — a `you` gap, a `waiting` gap, or a pending tool call. Left out of `active`; the single-session view shows how many there were. Attributed to the date the gap *starts* on. |
+
+Per-session table adds `started` (local time of the first event), `id` (first 8 characters of the session UUID), `prompts` (distinct typed prompts) and `title` (Claude's auto-title, else the first prompt).
+
+The single-session view (`--session`) shows the same buckets with their share of `active`, plus `wall` (first event → last event, equals `active + breaks`), the median and slowest *reply* (prompt → Claude's last output of that turn, tools and waiting included), the longest single tool call, and cost and models. Its per-turn table (`-v`) has one row per prompt: `reply` as above, `working` (Claude generation only, within that turn), `tools` (number of tool calls), `cost`, and the prompt's first line (`⏎` marks a turn you interrupted).
+
+Two caveats when reading sums: sessions running side by side each count in full, so a date's total across projects can exceed the clock; and a session that crosses midnight is split between the two dates. A live session is counted up to its last written event, so the turn still in progress is not in yet.
+
+Two things the transcript cannot show, so neither can this report: time you spend on the project without talking to Claude (editing, testing, reading) — it looks like a break — and, when the same project was opened under two folder names (renamed, moved), the sessions filed under the old name. Bind the old folder as a [merged project](#merged-projects) to see both together.
+
+```bash
+./time-report.py                         # accumulated time per project (active-sorted)
+./time-report.py --dates                 # per local day, all projects
+./time-report.py --dates <project>       # per day, one project
+./time-report.py --sessions <project>    # one row per session
+./time-report.py --session <id> [-v]     # one session; -v adds a per-turn table
+./time-report.py --merged                # per merged project
+./time-report.py --merged --dates <name>
+./time-report.py --merged --sessions <name>
+./time-report.py … --json                # machine-readable
+./time-report.py … --break-min 60        # longer pauses still count as active
+./time-report.py … --day-start 4         # night sessions stay on one date
+```
+
+`<project>` is the project path, an unambiguous trailing segment, or the transcript folder under `~/.claude/projects/` (full path — a bare slug starts with `-` and would be read as an option).
+
+Example (`--session … -v`):
+
+```
+session: <uuid>
+title:   Implement commit substitution feature
+project: ~/path/to/some-project
+started: 2026-04-17 15:26:32  (local time)
+ended:   2026-04-17 18:04:50
+wall:    2h 38m 18s
+active:  1h 51m 40s   (1 break(s) > 30m excluded: 46m 38s)
+
+  claude working                40m 12s   36%  ████████████
+    of which thinking           14m 03s
+  tools running                 39m 05s   35%  ███████████
+  waiting on you                 2m 10s    2%  ▌             questions / plan approval / declined prompts
+  you (reading, typing)         30m 13s   27%  █████████
+
+turns:         6 prompts   claude reply: median 4m 12s · max 21m 03s
+longest tool:  Bash 9m 41s
+cost:          $15.40 (list prices)   models: claude-opus-4-7
+
+  #  prompt (local)      reply  working tools    cost  prompt
+  1  2026-04-17 15:26   21m03s   11m40s    31 $  5.94  add correct gitignore, this where tut it, in…
+  2  2026-04-17 15:51    8m14s    5m02s    12 $  2.18  list sessions shows command wrapper, not rea…
+```
+
+In the TUI: **Time analytics** (all projects, `v` for by-date; a project or merged project, `v` for per-session) and, inside a session, **Time breakdown** (`v` for the per-turn table).
+
+### `export-prompts.py`
+
+Writes the prompts you typed. Default: one text file per session in `~/cct-export/<project>/` (override with `-o DIR` or `$CCT_EXPORT_DIR`), named `YYYY-MM-DD_HHMM_<shortid>.txt` from the session's local start time. Nothing is ever overwritten: if any target file already exists, the export stops before writing anything, lists the files in the way and exits 3 — pick another folder or move the old files yourself.
+
+```bash
+./export-prompts.py <project> [-o DIR] [--json]
+./export-prompts.py --merged <name> [-o DIR] [--json]
+./export-prompts.py --session <id> [-o DIR] [--json]
+```
+
+Text file:
+
+```
+session:  <uuid>
+title:    Implement commit substitution feature
+project:  ~/path/to/some-project
+started:  2026-04-17 15:26:32  (UTC+02:00)
+ended:    2026-04-17 18:04:50
+prompts:  6
+
+[1] 2026-04-17 15:26:32  (reply 21m03s · 31 tool calls · $5.94)
+add correct gitignore, this where tut it, in project level or root?
+
+[2] 2026-04-17 15:51:10  (reply 8m14s · 12 tool calls · $2.18)
+list sessions shows command wrapper, not real prompt
+```
+
+`--json` puts everything in one file (`<project>.prompts.json`, or `<start>_<shortid>.json` for `--session`), schema `cct-prompts/1`:
+
+```json
+{ "schema": "cct-prompts/1", "exported_at": "…Z", "tz": "UTC+02:00",
+  "project": { "name": "some-project", "root": "/path/to/some-project",
+               "slugs": ["-path-to-some-project"], "merged": false },
+  "session_count": 1, "prompt_count": 6, "cost_usd": 15.40,
+  "sessions": [
+    { "id": "<uuid>", "short_id": "5d35e607", "title": "Implement commit substitution feature",
+      "slug": "-path-to-some-project", "cwd": "/path/to/some-project",
+      "started": "2026-04-17T13:26:32.000Z", "ended": "2026-04-17T16:04:50.000Z",
+      "started_local": "2026-04-17 15:26:32", "ended_local": "2026-04-17 18:04:50",
+      "prompt_count": 6, "cost_usd": 15.40, "models": { "claude-opus-4-7": 120 },
+      "time": { "wall": 9498, "active": 6700, "working": 2412, "thinking": 843,
+                "tools": 2345, "approval": 0, "approval_calls": 0, "waiting": 130,
+                "idle": 1813, "breaks": 2798, "break_count": 1 },
+      "prompts": [
+        { "n": 1, "ts": "2026-04-17T13:26:32.000Z", "local": "2026-04-17 15:26:32",
+          "ts_approx": false,
+          "text": "add correct gitignore, this where tut it, in project level or root?",
+          "chars": 67, "words": 13, "lines": 1,
+          "response_seconds": 1263, "working_seconds": 700,
+          "tool_calls": 31, "tools": { "Bash": 12, "Read": 8, "Edit": 7, "Write": 3, "Grep": 1 },
+          "cost_usd": 5.94, "models": ["claude-opus-4-7"], "interrupted": false } ] } ] }
+```
+
+`ts_approx` is true when no typed user event preceded the snapshot (the timestamp is then the nearest earlier event). Times in seconds; `response_seconds` is prompt → Claude's last output of that turn.
+
+In the TUI: **Export prompts** (pick a project or merged project → format → folder), the same inside a merged project, and **Export prompts of this session** in the session action menu.
 
 ### `stack-report.sh`
 
@@ -352,3 +522,5 @@ High touches with low files = heavy iteration on a small set (e.g. `Bash 81/14`)
 - **`session-summary.sh <id>`** — print only user/assistant text from a session, stripping tool noise.
 - **`session-grep.sh <pattern>`** — full-text search across every transcript for a pattern.
 - **`tool-usage-all.sh`** — tally tool usage across _every_ session (useful for tuning the `less-permission-prompts` allowlist).
+- **Time by hour of day / weekday** — the buckets in `cct_lib.analyze_session` are keyed by gap start, so a heat map of when you actually work is one `group_by` away.
+- **Sub-agent cost** — `~/.claude/projects/<slug>/<session>/subagents/*.jsonl` hold Agent-tool transcripts with their own usage; none of the cost scripts include them yet.

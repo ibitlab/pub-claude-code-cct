@@ -14,14 +14,17 @@ FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 
 [[ -f "$TARGET" ]] || { echo "cct not found at $TARGET" >&2; exit 1; }
+[[ -f "$HERE/pricing.json" && -f "$HERE/pricing.jq" ]] \
+  || { echo "pricing.json / pricing.jq missing in $HERE" >&2; exit 1; }
 
 # Only touch the known scripts we ship — don't +x unrelated .sh a user might drop in.
 chmod +x "$TARGET" \
   "$HERE/list-sessions.sh" "$HERE/session-stats.sh" \
   "$HERE/session-tools.sh" "$HERE/dead-sessions.sh" \
-  "$HERE/cost-report.sh" "$HERE/stack-report.sh" \
+  "$HERE/cost-report.sh" "$HERE/project-costs.sh" "$HERE/stack-report.sh" \
   "$HERE/active-sessions.sh" "$HERE/status.sh" \
   "$HERE/session-questions.sh" \
+  "$HERE/time-report.py" "$HERE/export-prompts.py" \
   "$HERE/install.sh" "$HERE/uninstall.sh"
 
 mkdir -p "$BIN"

@@ -14,6 +14,13 @@ set -euo pipefail
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 
 ROOT="$HOME/.claude/projects"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# Shared jq helpers (dedup_events): after /compact the transcript holds exact
+# copies of earlier lines, which would count every tool call again.
+[[ -f "$HERE/pricing.json" && -f "$HERE/pricing.jq" ]] \
+  || { echo "pricing.json / pricing.jq missing next to $0" >&2; exit 1; }
+JQ_DEFS=$(jq -r '"def pricing: \(tojson);"' "$HERE/pricing.json"; cat "$HERE/pricing.jq")
 
 resolve_session() {
   local arg="$1"
@@ -35,9 +42,10 @@ FILE=$(resolve_session "${1:?session id or path required}")
 SHOW_COMMANDS=0
 [[ "${2:-}" == "--commands" ]] && SHOW_COMMANDS=1
 
-# Pull every tool_use block into a compact line: "name\t<json-input>"
-TOOL_USES=$(jq -c '
-  select(.type=="assistant")
+# Pull every tool_use block into a compact line: "name\t<json-input>".
+# Lines replayed after /compact are dropped first (same uuid → counted once).
+TOOL_USES=$(jq -cs "$JQ_DEFS"'
+  [ .[] | select(.type=="assistant") ] | dedup_events | .[]
   | .message.content[]?
   | select(.type=="tool_use")
   | {name, input}

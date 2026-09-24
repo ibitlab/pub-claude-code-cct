@@ -13,13 +13,14 @@
 #   ./cost-report.sh --months -v     # …with per-model breakdown per month
 #   ./cost-report.sh --month YYYY-MM # single-month detail (tokens + per-model)
 #
-# Same list-price pricing table as session-stats.sh (Claude 5 family / current
-# models). Estimates only — actual billing depends on your plan.
+# Prices come from pricing.json next to this script (shared by every cost
+# script). Estimates only — actual billing depends on your plan.
 
 set -euo pipefail
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 
 ROOT="$HOME/.claude/projects"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 EXTENDED=0
 MODE=windows
 MONTH=""
@@ -36,37 +37,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ---------- pricing (shared jq defs) ----------
-# List prices in USD per 1M tokens, current as of 2026-09 (Claude 5 family):
-#   Fable 5 / Mythos 5      $10 / $50    Opus 5, 4.8–4.5   $5 / $25
-#   older Opus (≤4.1)       $15 / $75    Sonnet 5          $2 / $10
-#   Sonnet 4.6 and older    $3 / $15     Haiku 4.5         $1 / $5
-#   older Haiku             $0.80 / $4
-# Cache: read = 0.1× input, 5m write = 1.25× input, 1h write = 2× input.
-# Unknown models are costed at current Opus rates.
-JQ_DEFS='
-    def price(mdl):
-      (mdl // "") as $m |
-      if   ($m | startswith("claude-fable")) or ($m | startswith("claude-mythos"))
-                                            then {inp:10,  out:50, rd:1,    c5:12.5,  c1:20}
-      elif $m | test("^claude-opus-(5|4-[5-9])")
-                                            then {inp:5,   out:25, rd:0.5,  c5:6.25,  c1:10}
-      elif $m | startswith("claude-opus")   then {inp:15,  out:75, rd:1.5,  c5:18.75, c1:30}
-      elif $m | test("^claude-sonnet-5")    then {inp:2,   out:10, rd:0.2,  c5:2.5,   c1:4}
-      elif $m | startswith("claude-sonnet") then {inp:3,   out:15, rd:0.3,  c5:3.75,  c1:6}
-      elif $m | test("^claude-haiku-(5|4-[5-9])")
-                                            then {inp:1,   out:5,  rd:0.1,  c5:1.25,  c1:2}
-      elif $m | startswith("claude-haiku")  then {inp:0.8, out:4,  rd:0.08, c5:1,     c1:1.6}
-      else                                       {inp:5,   out:25, rd:0.5,  c5:6.25,  c1:10}
-      end;
-    def cost_of(u; p):
-      ( (u.input_tokens               // 0) * p.inp
-      + (u.output_tokens              // 0) * p.out
-      + (u.cache_read_input_tokens    // 0) * p.rd
-      + (u.cache_creation.ephemeral_5m_input_tokens // 0) * p.c5
-      + (u.cache_creation.ephemeral_1h_input_tokens // 0) * p.c1
-      ) / 1e6;
-'
+# ---------- pricing (shared: pricing.json = the table, pricing.jq = the helpers) ----------
+[[ -f "$HERE/pricing.json" && -f "$HERE/pricing.jq" ]] \
+  || { echo "pricing.json / pricing.jq missing next to $0" >&2; exit 1; }
+JQ_DEFS=$(jq -r '"def pricing: \(tojson);"' "$HERE/pricing.json"; cat "$HERE/pricing.jq")
 
 # ---------- print helpers ----------
 
@@ -123,11 +97,11 @@ if [[ "$MODE" == months || "$MODE" == month ]]; then
                           print s * (substr($0,2,2)*3600 + substr($0,4,2)*60) }')
 
   AGG=$(collect_events | jq -sr --argjson off "$OFF" --arg month "$MONTH" "$JQ_DEFS"'
-    # Assistant events with usage → one record per event, bucketed by local
-    # calendar month. Timestamps missing fractional seconds fall back to the
-    # UTC YYYY-MM prefix.
-    [ .[]
-      | select(.type=="assistant" and .timestamp and .message.usage)
+    # Assistant messages with usage → one record per message, bucketed by
+    # local calendar month. Timestamps missing fractional seconds fall back
+    # to the UTC YYYY-MM prefix.
+    [ priced[]
+      | select(.timestamp)
       | { mo: (.timestamp
                | (try (sub("\\.[0-9]+Z$"; "Z")
                        | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime + $off
@@ -278,11 +252,11 @@ AGG=$(collect_events \
                      | map(select(.cost > 0))
                      | sort_by(-.cost)) };
 
-    # Assistant events with usage → {ts, sid, model, cost, end}. `end` flags the
-    # end_turn stop reason — equals one user round trip (last-prompt events
-    # have no timestamps, so we count end_turn instead).
-    [ .[]
-      | select(.type=="assistant" and .timestamp and .message.usage)
+    # Assistant messages with usage → {ts, sid, model, cost, end}. `end` flags
+    # the end_turn stop reason — equals one user round trip (last-prompt
+    # events have no timestamps, so we count end_turn instead).
+    [ priced[]
+      | select(.timestamp)
       | { ts:    .timestamp,
           sid:   .sessionId,
           model: (.message.model // "unknown"),
