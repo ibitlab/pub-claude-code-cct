@@ -367,15 +367,34 @@ def group_jsonls(group: Group) -> list[Path]:
 
 @dataclass
 class Buckets:
-    """Seconds per state. `active` excludes breaks."""
+    """Seconds per state. `active` excludes breaks.
+
+    Two of these are weaker than they look, and every view that prints them
+    has to say so:
+
+    `tools` holds the time you spent answering a permission dialog. The
+    transcript has no event for a dialog — only `tool_use` and `tool_result`
+    timestamps — so the answer time and the tool's own runtime are one number
+    that cannot be split. For a tool that normally returns instantly the
+    excess is almost certainly the dialog (see `approval`); for Bash and other
+    genuinely slow tools nothing in the log tells the two apart.
+
+    `idle` is a gap, not an observation. It is the span from Claude's last
+    output to your next prompt, and nothing records what happened in it: you
+    may have been reading, working in another session, or away from the desk.
+    Gaps above the break threshold are moved to `breaks`; below it they stay
+    here and are counted as active time.
+    """
     working: float = 0.0     # Claude generating (incl. thinking)
     thinking: float = 0.0    # of working: gaps that ended in a thinking-only block
-    tools: float = 0.0       # tool_use → tool_result (execution + permission dialogs)
+    tools: float = 0.0       # tool_use → tool_result (execution + permission dialogs, inseparable)
     approval: float = 0.0    # of tools: instant tools that stalled → likely permission prompt
     approval_n: int = 0
     agents: float = 0.0      # background agents / workflows running while the main thread waited
     waiting: float = 0.0     # blocked on you: question / plan approval / declined prompt
-    idle: float = 0.0        # Claude done, you reading / typing (≤ break threshold)
+                             # — NOT permission dialogs, which land in `tools`
+    idle: float = 0.0        # Claude done → your next prompt; unattended time is
+                             # indistinguishable from reading (≤ break threshold)
     breaks: float = 0.0      # idle gaps above the threshold — excluded from active
     breaks_n: int = 0
 
@@ -592,8 +611,14 @@ def analyze_session(path: Path, break_secs: float = DEFAULT_BREAK_SECS,
       ends in a tool result     → a tool ran / a permission dialog → tools
                                   (AskUserQuestion, plan approval or a
                                    declined tool → waiting on you)
-      ends in a typed prompt    → Claude was done, you were reading
-                                  or typing                        → idle
+      ends in a typed prompt    → Claude was done and nothing else
+                                  is recorded until you answer     → idle
+
+    Neither `tools` nor `idle` is as precise as it reads — see `Buckets`.
+    A permission dialog you answered with "yes" leaves no trace of its own
+    in the transcript, so the seconds you spent on it stay inside `tools`
+    and `waiting` can be zero in a session where you did wait; and `idle`
+    is the bare gap until your next prompt, whatever you were doing in it.
 
     Any gap longer than `break_secs` that was waiting on a person — an idle
     gap, a question, a pending tool call (a permission dialog left open

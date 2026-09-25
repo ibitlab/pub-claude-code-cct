@@ -1003,9 +1003,10 @@ def time_flow() -> None:
     while True:
         choice = menu(
             "cct · Time analytics",
-            "Where the hours went: Claude working · tools running · waiting on you · you (reading, typing).\n"
-            "Pauses over 30 min are breaks, left out of active time; work without Claude is invisible here.\n"
-            "Pick a project for its daily trend.",
+            "Where the hours went: Claude working · tools running · waiting on you · you.\n"
+            "Permission dialogs are counted as tools, not waiting; \"you\" is the gap until your next\n"
+            "prompt, whatever you did in it.  Pauses over 30 min are breaks, left out of active time;\n"
+            "work without Claude is invisible here.  Pick a project for its daily trend.",
             items, default=last,
         )
         if choice is None:
@@ -1293,7 +1294,10 @@ Menus:
                    export then count them together. Bindings are stored in
                    ~/.config/cct/merges.json; per-folder views are unchanged.
   Time analytics   Claude working / tools running / waiting on you / you,
-                   per project, per day, per session, per turn.
+                   per project, per day, per session, per turn.  Answering a
+                   permission dialog counts as tools, not waiting, and "you"
+                   is the gap to your next prompt, not observed presence;
+                   every table repeats both caveats underneath.
   Export prompts   Your typed prompts, one text file per session
                    (YYYY-MM-DD_HHMM_<id>.txt) or one JSON with per-prompt
                    timestamps, reply time, tool calls and cost.

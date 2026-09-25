@@ -15,10 +15,11 @@ days cost](docs/images/status.png)
 left to clean up.*
 
 ![Time by project: Claude working, tools running, background agents, waiting on
-you, and you reading and typing](docs/images/time-by-project.png)
+you, and the gap until your next prompt](docs/images/time-by-project.png)
 
 *And where the hours went — per project, split into Claude generating, tools
-running, background agents, waiting on you, and you reading and typing. Project
+running, background agents, waiting on you, and the gap until your next
+prompt. Every table spells out what those last two can and cannot know. Project
 names, paths, session ids and titles, and prompt text are blurred in all
 screenshots.*
 
@@ -80,7 +81,7 @@ You get a menu:
 | **Usage & cost by month** | Per-month totals, ←/→ to step between months |
 | **Cost by project** | Spend ranked by project, with a daily trend per project |
 | **Merged projects** | Bind an old location or a split-off folder to a primary project and see cost, sessions, time and exports for them together |
-| **Time analytics** | Where the hours went: Claude working, tools running, waiting on you, you reading/typing — per project, per day, per session |
+| **Time analytics** | Where the hours went: Claude working, tools running, waiting on you, the gap to your next prompt — per project, per day, per session |
 | **Export prompts** | Your typed prompts as one text file per session, or one JSON with per-prompt stats |
 | **Stack / tech used** | Languages and ecosystems you worked on, by time window |
 | **Troubleshooting / cleanup** | Dead project folders, stale session markers |
@@ -136,12 +137,24 @@ they were; bindings live in `~/.config/cct/merges.json`.
 buckets: **Claude working** (generating, including thinking), **tools running**
 (tool calls incl. permission dialogs), **agents** (background agents and
 workflows running while the main thread waited), **waiting on you** (questions,
-plan approval, declined prompts) and **you** (reading and typing between turns).
+plan approval, declined prompts) and **you** (the gap until your next prompt).
 Gaps longer than 30 minutes count as breaks and are left out of active time.
 You get it per project, per day, per session, and per turn inside one session
 (how long each reply took, how many tool calls, what it cost). Days are local
 calendar days. What you do on the project without talking to Claude is
 invisible to the transcript, so it shows up as a break.
+
+Two of those buckets are weaker than they look, and every table says so
+underneath. The seconds you spend answering a permission dialog are part of
+**tools running**: the transcript writes no event for a dialog, only the tool
+call and its result, so the dialog cannot be told apart from the tool's own
+runtime — for a tool that normally returns instantly the excess is flagged as a
+likely permission prompt, for `Bash` and friends nothing in the log separates
+them. **Waiting on you** therefore counts only questions, plan approval,
+declined calls and Esc, and a zero there does not mean you never waited. And
+**you** is a gap, not an observation: nothing records whether you read the
+answer, worked in another session, or walked away — only that the gap was
+shorter than the break threshold.
 
 Per project that is the table at the top of this page. One session up close —
 the same buckets as bars, what the background agents ran and cost, and (`v`)

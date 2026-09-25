@@ -77,13 +77,15 @@ SHOTS = {
     "cost-by-project":      dict(keys=["7", "enter", 6.0], rows=30),
     "project-daily-extended": dict(keys=["7", "enter", 6.0, "enter", 6.0, "v"], rows=40),
     "merged-projects":  dict(keys=["8", "enter", 1.5, "down", "enter", 4.0, "v"], rows=22),
-    "time-by-project":  dict(keys=["9", "enter", 2.0, "enter"], rows=42, settle=10.0),
-    "time-by-date":     dict(keys=["9", "enter", 2.0, "enter", 10.0, "v"], rows=42, settle=10.0),
+    # The time views carry a five-line "read with care" note under every table
+    # and a longer one under the single-session view — hence the tall rows.
+    "time-by-project":  dict(keys=["9", "enter", 2.0, "enter"], rows=48, settle=10.0),
+    "time-by-date":     dict(keys=["9", "enter", 2.0, "enter", 10.0, "v"], rows=48, settle=10.0),
     "time-session": dict(keys=["3", "enter", 4.0, "/" + SESSION_FILTER, 1.5,
-                               "enter", 2.0, "2", "enter"], rows=30, settle=10.0),
+                               "enter", 2.0, "2", "enter"], rows=41, settle=10.0),
     "time-session-turns": dict(keys=["3", "enter", 4.0, "/" + SESSION_FILTER, 1.5,
                                      "enter", 2.0, "2", "enter", 10.0, "v"],
-                               rows=42, settle=10.0),
+                               rows=53, settle=10.0),
     "export-prompts": dict(keys=["10", 1.5, "enter", 4.0, "/" + PROJECT_FILTER, 1.5,
                                  "enter", 2.0, "enter", 2.0, "enter"], rows=20, settle=8.0),
 }

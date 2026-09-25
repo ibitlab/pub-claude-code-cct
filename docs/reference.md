@@ -391,7 +391,7 @@ Where the hours went. Only timestamped `user`/`assistant` events on the main thr
 | --- | --- | --- |
 | assistant output | **claude working** | generating, including thinking (reported separately when the transcript has per-block lines) |
 | a tool result | **tools running** | tool execution, including the permission dialog in front of it. `AskUserQuestion`, `ExitPlanMode` and declined calls go to *waiting* instead. An instant tool (Read, Edit, Glob, …) that took longer than `--approve-secs` (15) is flagged as a likely permission prompt |
-| a typed prompt | **you** | Claude was done, you were reading or typing. A prompt you answered with Esc while a tool call was pending counts as *waiting*. If a background agent or workflow (transcripts under `<session-id>/subagents/`) was running during the gap, that part is **agents** instead |
+| a typed prompt | **you** | Claude was done and nothing more is recorded until you answer. A prompt you answered with Esc while a tool call was pending counts as *waiting*. If a background agent or workflow (transcripts under `<session-id>/subagents/`) was running during the gap, that part is **agents** instead |
 | Claude's next reply, with no prompt from you | *(as a `you` gap)* | Claude resumed by itself: auto-continue after a usage limit ("Continue from where you left off"), a background-task notification. Nothing was generating, so the gap is split into agents / you / break like an idle gap |
 
 Any gap longer than `--break-min` (30) that was waiting on a person — an idle gap, a question, a pending tool call — is a **break** and leaves active time: a permission dialog left open overnight is not tool time. (A tool that genuinely ran longer than the threshold lands there too; rare, and the threshold is yours to set.) Only Claude's own generation is never capped.
@@ -409,13 +409,23 @@ The by-project, by-date and per-session tables share these columns. Durations pr
 | `working` | Gaps that end in Claude's output: from your prompt to its first block, between its blocks, from a tool result to its next block. Thinking is inside this number; the single-session view breaks it out as *of which thinking* when the transcript has per-block lines. Never capped — Claude does not take breaks. |
 | `tools` | Gaps that end in a tool result: the tool running, plus the permission dialog in front of it, which the transcript cannot tell apart. Instant tools (Read, Edit, Write, Glob, Grep, …) slower than `--approve-secs` are counted here but flagged as *likely permission prompts* in the single-session view. |
 | `agents` | Time a background agent or workflow was running while the main thread had nothing to do (otherwise a `you` gap or a break). Overlapping agents count once. The single-session view also shows the number of runs, their total runtime and their cost. |
-| `waiting` | Claude blocked on you: `AskUserQuestion`, `ExitPlanMode` (plan approval), a tool call you declined, or a permission prompt you left with Esc. |
-| `you` | Gaps that end in your next typed prompt after Claude finished: reading the answer, thinking, typing, poking around the IDE. |
+| `waiting` | Claude blocked on you: `AskUserQuestion`, `ExitPlanMode` (plan approval), a tool call you declined, or a permission prompt you left with Esc. A permission prompt you *approved* is not here — it is in `tools`, so a zero in this column does not mean you never waited. |
+| `you` | Gaps that end in your next typed prompt after Claude finished. A gap, not an observation: nothing in the transcript records whether you read the answer, worked in another session, or walked away — only that the gap stayed under `--break-min`. |
 | `breaks` | Any gap longer than `--break-min` (30) that was waiting on a person — a `you` gap, a `waiting` gap, or a pending tool call. Left out of `active`; the single-session view shows how many there were. Attributed to the date the gap *starts* on. |
 
 Per-session table adds `started` (local time of the first event), `id` (first 8 characters of the session UUID), `prompts` (distinct typed prompts) and `title` (Claude's auto-title, else the first prompt).
 
 The single-session view (`--session`) shows the same buckets with their share of `active`, plus `wall` (first event → last event, equals `active + breaks`), the median and slowest *reply* (prompt → Claude's last output of that turn, tools and waiting included), the longest single tool call, and cost (main transcript + background agents) and models. Its per-turn table (`-v`) has one row per prompt: `reply` as above, `working` (Claude generation only, within that turn), `tools` (number of tool calls), `cost`, and the prompt's first line (`⏎` marks a turn you interrupted).
+
+#### What the transcript cannot tell you
+
+Two buckets carry an uncertainty that no amount of parsing removes, so every table and the single-session view repeat it underneath.
+
+**A permission dialog you approved is invisible.** The transcript records the tool call and its result and nothing in between — there is no event for a dialog opening, none for your answer, and the tool result carries no execution time of its own. The seconds you spent reading the command and pressing *yes* are therefore inside **tools**, welded to the tool's own runtime. Where the tool normally returns instantly (`Read`, `Edit`, `Glob`, …) the excess over `--approve-secs` is almost certainly the dialog, and the single-session view flags it as *likely permission prompts*; where the tool can genuinely be slow (`Bash`, `WebFetch`, `Agent`, …) nothing in the log separates the two, and cct does not guess. The practical consequence: **waiting** can read `0s` in a session where you answered several dialogs, because that column only ever counted `AskUserQuestion`, `ExitPlanMode`, declined calls and Esc.
+
+**The `you` bucket is a gap, not attendance.** It is the span from Claude's last output to your next typed prompt. Claude Code writes nothing about what you did in it, and there is no idle or focus signal in the transcript, so reading the answer carefully, working in a different session, and having left the room are one and the same number here. `--break-min` (30 minutes) is the only lever: above it a gap becomes a **break** and leaves active time, below it the whole gap is counted as you being there. If your sessions overlap — you kept working here while that one finished — expect this column to be generous.
+
+Everything else is measured: `working`, `tools` as a total, `agents` and the turn-level figures come straight from timestamps.
 
 Two caveats when reading sums: sessions running side by side each count in full, so a date's total across projects can exceed the clock; and a session that crosses midnight is split between the two dates. A live session is counted up to its last written event, so the turn still in progress is not in yet.
 
@@ -454,9 +464,9 @@ active:  1h 51m 40s   (1 break(s) > 30m excluded: 46m 38s)
 
   claude working                40m 12s   36%  ████████████
     of which thinking           14m 03s
-  tools running                 39m 05s   35%  ███████████
-  waiting on you                 2m 10s    2%  ▌             questions / plan approval / declined prompts
-  you (reading, typing)         30m 13s   27%  █████████
+  tools running                 39m 05s   35%  ███████████   execution + permission dialogs, inseparable
+  waiting on you                 2m 10s    2%  ▌             questions / plan approval / declined prompts only
+  you (gap to next prompt)      30m 13s   27%  █████████     not observed — see the note below
 
 turns:         6 prompts   claude reply: median 4m 12s · max 21m 03s
 longest tool:  Bash 9m 41s
@@ -465,7 +475,16 @@ cost:          $15.40 (list prices)   models: claude-opus-4-7
   #  prompt (local)      reply  working tools    cost  prompt
   1  2026-04-17 15:26   21m03s   11m40s    31 $  5.94  add correct gitignore, this where tut it, in…
   2  2026-04-17 15:51    8m14s    5m02s    12 $  2.18  list sessions shows command wrapper, not rea…
+
+  Times come from event timestamps, and two of these numbers are weaker
+  than they look:
+   · the seconds you spend answering a permission dialog are inside
+     "tools running".  …
+   · "you" is the bare gap until your next prompt.  …
+  (background agents are priced from their own transcripts)
 ```
+
+`reply` in that table is the whole turn — Claude's generation, the tools, and any permission dialog you answered inside it. The `--json` output carries the same numbers without the notes; read them together with [What the transcript cannot tell you](#what-the-transcript-cannot-tell-you).
 
 In the TUI: **Time analytics** (all projects, `v` for by-date; a project or merged project, `v` for per-session) and, inside a session, **Time breakdown** (`v` for the per-turn table).
 

@@ -11,9 +11,16 @@ attributed to whoever was busy during it:
                    <session-id>/subagents/ and are priced from there)
   waiting on you   AskUserQuestion, plan approval, a declined tool call, or a
                    permission prompt you answered with Esc
-  you              Claude finished → your next prompt (reading, typing)
+  you              Claude finished → your next prompt
   breaks           "you" gaps longer than --break-min — walked away; excluded
                    from active time
+
+Two caveats, repeated under every table: the time you spend answering a
+permission dialog stays in "tools running" (the transcript has no event for a
+dialog, so it cannot be told apart from the tool's own runtime) — "waiting on
+you" therefore counts only questions, plan approval, declined calls and Esc;
+and "you" is the bare gap until your next prompt, with nothing recording
+whether you were reading, in another session, or away from the desk.
 
 Usage:
   ./time-report.py                         # accumulated time per project
@@ -61,9 +68,15 @@ def legend(args) -> str:
         "  tools     tool calls running, permission dialogs included",
         "  agents    background agents / workflows running while the main thread waited",
         "  waiting   Claude blocked on you: question, plan approval, declined call",
-        "  you       reading / typing between Claude's answer and your next prompt",
+        "  you       from Claude's answer to your next prompt",
         "  active    working + tools + agents + waiting + you",
         f"  breaks    pauses over {args.break_min:g}m while waiting on you; not part of active",
+        "",
+        "  read with care: answering a permission dialog counts as tools, not",
+        "  waiting — the transcript has no event for a dialog, so it cannot be",
+        "  told apart from the tool's own runtime, and waiting = 0 does not mean",
+        "  you never waited.  you is a gap, not an observation: nothing records",
+        "  whether you read the answer, worked in another session, or were away.",
     ]
     if args.day_start:
         lines.append(f"  days start at {int(args.day_start):02d}:00 local")
@@ -247,14 +260,14 @@ def print_session(a: L.SessionAnalysis, args):
     line("claude working", b.working)
     if a.has_block_events and b.thinking:
         print(f"    of which thinking      {L.fmt_dur_long(b.thinking):>12}")
-    line("tools running", b.tools)
+    line("tools running", b.tools, "execution + permission dialogs, inseparable")
     if b.approval_n:
         print(f"    likely permission prompts {L.fmt_dur_long(b.approval):>9}  ({b.approval_n} instant tool(s) > {args.approve_secs}s)")
     if a.agent_runs:
         line("background agents", b.agents, "workflows / Agent tool while the main thread waited")
         print(f"    {a.agent_runs} run(s), {L.fmt_dur_long(a.agent_runtime)} of agent time in total, ${a.cost_agents:.2f}")
-    line("waiting on you", b.waiting, "questions / plan approval / declined prompts")
-    line("you (reading, typing)", b.idle)
+    line("waiting on you", b.waiting, "questions / plan approval / declined prompts only")
+    line("you (gap to next prompt)", b.idle, "not observed — see the note below")
     print()
 
     rt = a.response_times
@@ -280,8 +293,18 @@ def print_session(a: L.SessionAnalysis, args):
             print(f"{p.n:>3}  {when:16} {reply:>8} {L.fmt_dur(p.working_secs):>8} {sum(p.tools.values()):>5}"
                   f" ${p.cost + p.cost_agents:6.2f}  {text[:44]}{flag}")
     print()
-    print("  (times come from event timestamps; tool time includes permission dialogs;")
-    print("   background agents are priced from their own transcripts)")
+    print("  Times come from event timestamps, and two of these numbers are weaker")
+    print("  than they look:")
+    print("   · the seconds you spend answering a permission dialog are inside")
+    print("     \"tools running\".  The transcript writes no event for a dialog, only")
+    print("     the tool call and its result, so the dialog cannot be told apart from")
+    print("     the tool's own runtime — for Bash and other slow tools not at all.")
+    print("     \"waiting on you\" counts only questions, plan approval, declined calls")
+    print("     and Esc, so a 0 there does not mean you never waited.")
+    print("   · \"you\" is the bare gap until your next prompt.  Nothing records whether")
+    print("     you read the answer, worked in another session, or left the desk; only")
+    print(f"     gaps over {args.break_min:g}m drop out of active time as breaks.")
+    print("  (background agents are priced from their own transcripts)")
 
 
 # ---------------------------------------------------------------- main
