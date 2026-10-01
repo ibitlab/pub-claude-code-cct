@@ -203,19 +203,21 @@ cost (estimate, list prices):
 
 #### Cost model
 
-Prices are list USD per 1M tokens (as of 2026-09) and live in **one file, `pricing.json`**, read by every cost script and by `cct_lib.py`; `pricing.jq` holds the shared jq helpers (`price`, `cost_of`, `priced`) that use it. Each rule is a regex on the model id, tried top to bottom; the last rule (empty regex) prices unknown models. To change prices, edit `pricing.json` only (cache write 5m = 1.25× input, 1h = 2× input, cache read = 0.1× input):
+Prices are list USD per 1M tokens (as of 2026-10) and live in **one file, `pricing.json`**, read by every cost script and by `cct_lib.py`; `pricing.jq` holds the shared jq helpers (`price`, `cost_of`, `priced`) that use it. Each rule is a regex on the model id, tried top to bottom; the last rule (empty regex) prices unknown models. To change prices, edit `pricing.json` only (cache write 5m = 1.25× input, 1h = 2× input, cache read = 0.1× input, except Opus 5.5 and Fable/Mythos 5.1, listed below):
 
 | Family                    | Input | Output | Cache write 5m | Cache write 1h | Cache read |
 | ------------------------- | ----- | ------ | -------------- | -------------- | ---------- |
+| Fable 5.1 / Mythos 5.1    | $10   | $50    | $12.50         | $20            | $0.25      |
 | Fable 5 / Mythos 5        | $10   | $50    | $12.50         | $20            | $1.00      |
+| Opus 5.5                  | $4    | $20    | $5.00          | $8             | $0.20      |
 | Opus 5, 4.8–4.5           | $5    | $25    | $6.25          | $10            | $0.50      |
 | Opus 4.1 and older        | $15   | $75    | $18.75         | $30            | $1.50      |
-| Sonnet 5                  | $2    | $10    | $2.50          | $4             | $0.20      |
+| Sonnet 5 / 5.5            | $2    | $10    | $2.50          | $4             | $0.20      |
 | Sonnet 4.6 and older      | $3    | $15    | $3.75          | $6             | $0.30      |
 | Haiku 4.5                 | $1    | $5     | $1.25          | $2             | $0.10      |
 | Haiku 4 and older         | $0.80 | $4     | $1.00          | $1.60          | $0.08      |
 
-Unknown model ids are costed at current Opus rates.
+Unknown model ids are costed at current Opus (5.5) rates.
 
 If a session used multiple models, cost is split and summed per model. Background-agent transcripts of the session (`<session-id>/subagents/`) are included and reported on an `agents:` line. Actual billing may differ (contract rates, batch API discounts, server-tool fees for web search/fetch are not included).
 
