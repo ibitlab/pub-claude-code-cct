@@ -213,3 +213,9 @@ directly if you'd rather script or pipe the output.
 
 Full options and example output for each of them are in
 [docs/reference.md](docs/reference.md#scripts).
+
+## License
+
+MIT — [LICENSE](LICENSE). Use it, change it, ship it; the only condition is
+keeping the copyright line. No warranty of any kind: see the heads-up at the
+top, the numbers are estimates and may be wrong.
