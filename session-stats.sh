@@ -130,71 +130,34 @@ echo
 
 # ---------- Cost estimate ----------
 # LIST prices from pricing.json — actual billing may differ (contract tiers,
-# batch, etc).
-price_for_model() {
-  # sets globals: P_IN P_OUT P_5M P_1H P_READ (USD per 1M tokens)
-  read -r P_IN P_OUT P_READ P_5M P_1H < <(
-    jq -rn --arg m "$1" "$JQ_DEFS"'price($m) | "\(.inp) \(.out) \(.rd) \(.c5) \(.c1)"')
-}
-
-# If the session used a single model, cost it against that model's rates.
-# If multiple, sum per-model by grouping assistant events.
-MODELS=$(jq -rs "$JQ_DEFS"'priced[] | .message.model' "${FILES[@]}" | sort -u)
-MODEL_COUNT=$(echo "$MODELS" | grep -c .)
+# batch, etc). Costed per API message, not from the totals above: some
+# models price a request by its prompt length (long_prompt in pricing.json).
+# One line per model: model, then USD for input output cache_5m cache_1h read.
+COSTS=$(jq -rs "$JQ_DEFS"'
+  [priced[] | .message] | group_by(.model // "")[]
+  | (.[0].model // "unknown") as $m | price($m) as $p
+  | (map(costs_of(.usage; $p)) | reduce .[] as $c ({};
+      reduce ($c | keys[]) as $k (.; .[$k] += $c[$k]))) as $s
+  | [$m, $s.input // 0, $s.output // 0, $s.cache_5m // 0, $s.cache_1h // 0,
+     $s.cache_read // 0] | @tsv
+' "${FILES[@]}")
 
 echo "cost (estimate, list prices):"
-if [[ "$MODEL_COUNT" -le 1 ]]; then
-  MODEL="$MODELS"
-  price_for_model "$MODEL"
-  IN=$(echo "$TOTALS"    | jq -r '.input')
-  OUT=$(echo "$TOTALS"   | jq -r '.output')
-  READ=$(echo "$TOTALS"  | jq -r '.cache_read')
-  C5M=$(echo "$TOTALS"   | jq -r '.cache_5m')
-  C1H=$(echo "$TOTALS"   | jq -r '.cache_1h')
-  awk -v m="${MODEL:-unknown}" \
-      -v i="$IN"    -v pi="$P_IN" \
-      -v o="$OUT"   -v po="$P_OUT" \
-      -v r="$READ"  -v pr="$P_READ" \
-      -v f="$C5M"   -v pf="$P_5M" \
-      -v h="$C1H"   -v ph="$P_1H" \
-      'BEGIN {
-         ci = i*pi/1e6; co = o*po/1e6; cr = r*pr/1e6;
-         cf = f*pf/1e6; ch = h*ph/1e6;
-         printf "  model:        %s\n", m;
-         printf "  input:        $%.4f\n", ci;
-         printf "  output:       $%.4f\n", co;
-         printf "  cache 5m:     $%.4f\n", cf;
-         printf "  cache 1h:     $%.4f\n", ch;
-         printf "  cache read:   $%.4f\n", cr;
-         printf "  ─ total ─     $%.4f\n", ci+co+cf+ch+cr;
-       }'
+if [[ $(echo "$COSTS" | grep -c .) -le 1 ]]; then
+  echo "$COSTS" | awk -F'\t' '
+    { m=$1; ci=$2; co=$3; cf=$4; ch=$5; cr=$6 }
+    END {
+      printf "  model:        %s\n", (m == "" ? "unknown" : m);
+      printf "  input:        $%.4f\n", ci;
+      printf "  output:       $%.4f\n", co;
+      printf "  cache 5m:     $%.4f\n", cf;
+      printf "  cache 1h:     $%.4f\n", ch;
+      printf "  cache read:   $%.4f\n", cr;
+      printf "  ─ total ─     $%.4f\n", ci+co+cf+ch+cr;
+    }'
 else
-  # Per-model cost, then sum.
-  TOTAL=0
-  while IFS= read -r MODEL; do
-    [[ -z "$MODEL" ]] && continue
-    price_for_model "$MODEL"
-    # One "key value" line per token class — plain words, so awk can match
-    # them (JSON output would quote the keys and nothing would match).
-    SUBTOTALS=$(jq -rs --arg m "$MODEL" "$JQ_DEFS"'
-      [priced[] | select(.message.model==$m) | .message.usage] as $u
-      | "input \($u | map(.input_tokens // 0) | add // 0)",
-        "output \($u | map(.output_tokens // 0) | add // 0)",
-        "read \($u | map(.cache_read_input_tokens // 0) | add // 0)",
-        "cache_5m \($u | map(.cache_creation.ephemeral_5m_input_tokens // 0) | add // 0)",
-        "cache_1h \($u | map(.cache_creation.ephemeral_1h_input_tokens // 0) | add // 0)"
-      ' "${FILES[@]}")
-    cost=$(echo "$SUBTOTALS" | awk \
-        -v pi="$P_IN" -v po="$P_OUT" -v pr="$P_READ" -v pf="$P_5M" -v ph="$P_1H" '
-        $1 == "input"    { i=$2 }
-        $1 == "output"   { o=$2 }
-        $1 == "read"     { r=$2 }
-        $1 == "cache_5m" { f=$2 }
-        $1 == "cache_1h" { h=$2 }
-        END { printf "%.4f", (i*pi + o*po + r*pr + f*pf + h*ph)/1e6 }')
-    printf '  %-20s $%s\n' "$MODEL" "$cost"
-    TOTAL=$(awk -v a="$TOTAL" -v b="$cost" 'BEGIN{printf "%.4f", a+b}')
-  done <<< "$MODELS"
-  printf '  ─ total ─           $%s\n' "$TOTAL"
+  echo "$COSTS" | awk -F'\t' '
+    { c = $2+$3+$4+$5+$6; t += c; printf "  %-20s $%.4f\n", $1, c }
+    END { printf "  ─ total ─           $%.4f\n", t }'
 fi
 echo "  (list prices; actual billing may differ)"

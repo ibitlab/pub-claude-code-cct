@@ -203,7 +203,7 @@ cost (estimate, list prices):
 
 #### Cost model
 
-Prices are list USD per 1M tokens (as of 2026-10) and live in **one file, `pricing.json`**, read by every cost script and by `cct_lib.py`; `pricing.jq` holds the shared jq helpers (`price`, `cost_of`, `priced`) that use it. Each rule is a regex on the model id, tried top to bottom; the last rule (empty regex) prices unknown models. To change prices, edit `pricing.json` only (cache write 5m = 1.25× input, 1h = 2× input, cache read = 0.1× input, except Opus 5.5 and Fable/Mythos 5.1, listed below):
+Prices are list USD per 1M tokens (as of 2026-10) and live in **one file, `pricing.json`**, read by every cost script and by `cct_lib.py`; `pricing.jq` holds the shared jq helpers (`price`, `cost_of`, `costs_of`, `priced`) that use it. Each rule is a regex on the model id, tried top to bottom; the last rule (empty regex) prices unknown models. A rule may carry a second price set, `long_prompt`, for requests whose prompt (input + cache read + cache write tokens) is over a threshold; it is checked per API message, so a session can mix both. To change prices, edit `pricing.json` only (cache write 5m = 1.25× input, 1h = 2× input, cache read = 0.1× input, except where the table below says otherwise):
 
 | Family                    | Input | Output | Cache write 5m | Cache write 1h | Cache read |
 | ------------------------- | ----- | ------ | -------------- | -------------- | ---------- |
@@ -212,8 +212,11 @@ Prices are list USD per 1M tokens (as of 2026-10) and live in **one file, `prici
 | Opus 5.5                  | $4    | $20    | $5.00          | $8             | $0.20      |
 | Opus 5, 4.8–4.5           | $5    | $25    | $6.25          | $10            | $0.50      |
 | Opus 4.1 and older        | $15   | $75    | $18.75         | $30            | $1.50      |
-| Sonnet 5 / 5.5            | $2    | $10    | $2.50          | $4             | $0.20      |
+| Sonnet 5.5                | $2    | $10    | $2.50          | $4             | $0.10      |
+| Sonnet 5                  | $2    | $10    | $2.50          | $4             | $0.20      |
 | Sonnet 4.6 and older      | $3    | $15    | $3.75          | $6             | $0.30      |
+| Haiku 5.5, prompt ≤ 100k  | $0.10 | $0.50  | $0.125         | $0.20          | $0.01      |
+| Haiku 5.5, prompt > 100k  | $0.50 | $2.50  | $0.625         | $1             | $0.05      |
 | Haiku 4.5                 | $1    | $5     | $1.25          | $2             | $0.10      |
 | Haiku 4 and older         | $0.80 | $4     | $1.00          | $1.60          | $0.08      |
 

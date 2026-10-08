@@ -165,32 +165,54 @@ PRICING_FILE = Path(__file__).resolve().parent / "pricing.json"
 _rules: list | None = None
 
 
+def _prices(r: dict) -> tuple:
+    return (r["input"], r["output"], r["cache_read"], r["cache_5m"], r["cache_1h"])
+
+
 def _pricing_rules() -> list:
     global _rules
     if _rules is None:
         data = json.loads(PRICING_FILE.read_text())
-        _rules = [
-            (re.compile(r["match"]),
-             (r["input"], r["output"], r["cache_read"], r["cache_5m"], r["cache_1h"]))
-            for r in data["rules"]
-        ]
+        _rules = []
+        for r in data["rules"]:
+            lp = r.get("long_prompt")
+            _rules.append((re.compile(r["match"]), _prices(r),
+                           (lp["over"], _prices(lp)) if lp else None))
         if not _rules:
             raise ValueError(f"{PRICING_FILE}: no pricing rules")
     return _rules
 
 
-def price_for(model: str | None):
-    """(input, output, cache-read, cache-5m, cache-1h) in USD per 1M tokens."""
+def _rule_for(model: str | None):
     m = model or ""
     rules = _pricing_rules()
-    for rx, p in rules:
-        if rx.search(m):
-            return p
-    return rules[-1][1]
+    for rule in rules:
+        if rule[0].search(m):
+            return rule
+    return rules[-1]
+
+
+def price_for(model: str | None):
+    """(input, output, cache-read, cache-5m, cache-1h) in USD per 1M tokens,
+    for an ordinary-length prompt."""
+    return _rule_for(model)[1]
+
+
+def prompt_tokens(usage: dict) -> int:
+    """Prompt size of one request: everything that went in, cached or not."""
+    cc = usage.get("cache_creation") or {}
+    written = usage.get("cache_creation_input_tokens")
+    if written is None:
+        written = (cc.get("ephemeral_5m_input_tokens") or 0) \
+            + (cc.get("ephemeral_1h_input_tokens") or 0)
+    return (usage.get("input_tokens") or 0) \
+        + (usage.get("cache_read_input_tokens") or 0) + written
 
 
 def cost_of(usage: dict, model: str | None) -> float:
-    inp, out, rd, c5, c1 = price_for(model)
+    _, base, long = _rule_for(model)
+    inp, out, rd, c5, c1 = \
+        long[1] if long and prompt_tokens(usage) > long[0] else base
     cc = usage.get("cache_creation") or {}
     return (
         (usage.get("input_tokens") or 0) * inp

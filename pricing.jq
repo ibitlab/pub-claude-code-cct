@@ -8,21 +8,35 @@
 #
 # Nothing here needs editing when prices change — edit pricing.json.
 
+def _prec: { inp: .input, out: .output, rd: .cache_read, c5: .cache_5m, c1: .cache_1h };
+
 # Price record for a model id. Rules are tried in order; the first whose
-# regex matches wins; the last rule (empty regex) is the fallback.
+# regex matches wins; the last rule (empty regex) is the fallback. `long`
+# is the rule's long_prompt set (with its `over` threshold) or null.
 def price(mdl):
   (mdl // "") as $m
   | ( first(pricing.rules[] | select(.match as $re | $m | test($re))) // pricing.rules[-1] )
-  | { inp: .input, out: .output, rd: .cache_read, c5: .cache_5m, c1: .cache_1h };
+  | _prec + { long: (.long_prompt | if . then _prec + { over } else null end) };
+
+# Prompt size of one request: everything that went in, cached or not.
+def prompt_tokens(u):
+  (u.input_tokens // 0) + (u.cache_read_input_tokens // 0)
+  + (u.cache_creation_input_tokens
+     // ((u.cache_creation.ephemeral_5m_input_tokens // 0)
+         + (u.cache_creation.ephemeral_1h_input_tokens // 0)));
+
+# USD per token class for one `usage` object at price record p — the long
+# prompt set when this request's prompt is over its threshold.
+def costs_of(u; p):
+  (if p.long and prompt_tokens(u) > p.long.over then p.long else p end) as $q
+  | { input:      ((u.input_tokens               // 0) * $q.inp / 1e6),
+      output:     ((u.output_tokens              // 0) * $q.out / 1e6),
+      cache_read: ((u.cache_read_input_tokens    // 0) * $q.rd  / 1e6),
+      cache_5m:   ((u.cache_creation.ephemeral_5m_input_tokens // 0) * $q.c5 / 1e6),
+      cache_1h:   ((u.cache_creation.ephemeral_1h_input_tokens // 0) * $q.c1 / 1e6) };
 
 # USD for one `usage` object at price record p.
-def cost_of(u; p):
-  ( (u.input_tokens               // 0) * p.inp
-  + (u.output_tokens              // 0) * p.out
-  + (u.cache_read_input_tokens    // 0) * p.rd
-  + (u.cache_creation.ephemeral_5m_input_tokens // 0) * p.c5
-  + (u.cache_creation.ephemeral_1h_input_tokens // 0) * p.c1
-  ) / 1e6;
+def cost_of(u; p): costs_of(u; p) | add;
 
 # Claude Code writes one transcript line per content block of an API message
 # (thinking, text, each tool_use), and every line repeats the message usage.
