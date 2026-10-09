@@ -345,7 +345,7 @@ Cost by project (estimate at list prices)
 total                                                   $  125.17
 ```
 
-`<project>` accepts the full path (`~/…` or absolute) or any unambiguous trailing segment (`webapp`); an ambiguous argument lists the candidates and exits non-zero rather than silently picking one.
+`<project>` accepts the full path (`~/…` or absolute), any unambiguous trailing segment (`webapp`), or the folder's name under `~/.claude/projects/`; an ambiguous argument lists the candidates and exits non-zero rather than silently picking one.
 
 #### What counts as one project
 
@@ -358,7 +358,7 @@ A project is **one folder under `~/.claude/projects/`** — the directory Claude
 
 Each project is labelled with the shortest `cwd` recorded inside it, which is the folder that was opened. Long paths are clipped from the left, keeping the distinctive tail.
 
-In the TUI, **Cost by project** ranks all projects by total cost; pick one to see its daily trend. `v` toggles the per-model breakdown in either view.
+In the TUI, **Cost by project** lists projects alphabetically (it opens at once, without pricing anything); pick one to see its daily trend, or *All projects — summary table* for the ranking by total cost. `v` toggles the per-model breakdown in either view.
 
 #### Merged projects
 

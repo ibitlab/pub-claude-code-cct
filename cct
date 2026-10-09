@@ -833,20 +833,16 @@ def monthly_flow() -> None:
 
 def projects_flow() -> None:
     """Per-project cost breakdown, drilling into one project's daily trend."""
-    # `--list` prints full cwd paths, cost-sorted, one per line — a stable
-    # contract, unlike scraping the human table whose columns are clipped.
-    listing = run_script("project-costs.sh", "--list")
-    home = str(Path.home())
-    projects = [ln for ln in listing.splitlines() if ln.startswith("/")]
+    # The picker lists folders alphabetically from a plain scan — no pricing
+    # pass, so it opens at once; the summary table is the cost-ranked view.
+    projects = sorted(L.discover_projects(), key=lambda p: p.label.lower())
     if not projects:
         render_output("Cost by project", run_script("project-costs.sh"))
         return
 
-    def label(p: str) -> str:
-        return "~" + p[len(home):] if p.startswith(home + "/") else p
-
     items: list[tuple] = [("summary", "All projects — summary table")]
-    items += [(p, label(p)) for p in projects]
+    items += [(p.slug, p.label) for p in projects]
+    labels = dict(items)
     while True:
         choice = menu(
             "cct · Cost by project",
@@ -866,7 +862,7 @@ def projects_flow() -> None:
             )
         else:
             render_output_refresh(
-                lambda v, p=label(choice): f"Daily cost — {p}" + (" (extended)" if v else ""),
+                lambda v, p=labels[choice]: f"Daily cost — {p}" + (" (extended)" if v else ""),
                 lambda v, proj=choice: run_script(
                     "project-costs.sh", "--dates", proj, *(["-v"] if v else [])
                 ),
@@ -965,8 +961,8 @@ def export_run(args: list[str], name: str) -> None:
                   run_script("export-prompts.py", *args, "-o", out, *extra))
 
 def export_flow() -> None:
-    projects = L.discover_projects()
-    groups = L.load_groups()
+    projects = sorted(L.discover_projects(), key=lambda p: p.label.lower())
+    groups = sorted(L.load_groups(), key=lambda g: g.name.lower())
     items: list[tuple] = [(f"g:{g.name}", f"⊕ {g.name}  ({len(L.group_dirs(g))} folders)") for g in groups]
     items += [(f"p:{p.slug}", _folder_label(p)) for p in projects]
     if not items:
@@ -992,8 +988,9 @@ def export_flow() -> None:
 # ---------- time analytics ----------
 
 def time_flow() -> None:
-    projects = L.discover_projects()
-    groups = L.load_groups()
+    # Pickers list alphabetically; the "All"/"Merged" tables rank by time.
+    projects = sorted(L.discover_projects(), key=lambda p: p.label.lower())
+    groups = sorted(L.load_groups(), key=lambda g: g.name.lower())
     items: list[tuple] = [("all", "All projects — accumulated time (v: by date)")]
     if groups:
         items.append(("merged", "Merged projects — accumulated time"))

@@ -108,7 +108,7 @@ every window by model (Fable magenta, Opus blue, Sonnet green, Haiku yellow):
 
 ![Cost report, extended](docs/images/cost-report-extended.png)
 
-**Cost by project** ranks your projects by total spend:
+**Cost by project** lists your projects alphabetically; its summary table ranks them by total spend:
 
 ![Cost by project](docs/images/cost-by-project.png)
 

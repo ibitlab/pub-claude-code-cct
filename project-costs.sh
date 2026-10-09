@@ -30,8 +30,9 @@
 # Each project is labelled with the shortest cwd recorded inside it, which is
 # the folder that was opened.
 #
-# <project> accepts that label (`~/…` or absolute) or any unambiguous trailing
-# segment of it; an ambiguous argument lists candidates and exits non-zero.
+# <project> accepts that label (`~/…` or absolute), any unambiguous trailing
+# segment of it, or the folder's own name under ~/.claude/projects/; an
+# ambiguous argument lists candidates and exits non-zero.
 #
 # Merged projects
 # ---------------
@@ -365,6 +366,16 @@ fi
 # Mode: daily trend for one project
 # ==================================================================
 if [[ "$MODE" == dates ]]; then
+  # A folder name under ~/.claude/projects/ (what the TUI passes) needs no
+  # search, so skip pricing every other project just to resolve the argument.
+  if [[ "$PROJECT" != */* && "$PROJECT" != . && "$PROJECT" != .. && -d "$ROOT/$PROJECT" ]]; then
+    PDIR="$ROOT/$PROJECT"
+    LABEL=$(cat_dirs "$PDIR" | jq -sr --arg fb "$PROJECT" "$JQ_DEFS"'project_root($fb)' \
+            | sed "s|^$HOME|~|")
+    print_daily "$LABEL" "$PDIR"
+    exit 0
+  fi
+
   ROWS=$(project_rows)
   [[ -z "$ROWS" ]] && { echo "No usage recorded." >&2; exit 1; }
 
