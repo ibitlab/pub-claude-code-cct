@@ -55,6 +55,26 @@ What it does cost:
 
 If you want history beyond the window without keeping the transcripts, export the prompts ([`export-prompts.py`](#export-promptspy)) — exported files live outside `~/.claude/` and the sweep never touches them.
 
+### Seeing what Claude is doing: `showThinkingSummaries` and verbose output
+
+A long `Thinking… · 30k tokens` line with nothing else moving looks like a hang, and the time report later files all of it under `working` (*of which thinking*). Two settings make that stretch readable while it happens:
+
+```json
+{
+  "showThinkingSummaries": true,
+  "viewMode": "verbose"
+}
+```
+
+- **`showThinkingSummaries`** — show the text of Claude's reasoning instead of the collapsed `Thinking…` stub. On the Claude 5 models (Opus 5.5, Sonnet 5.5, Fable 5.1, Haiku 5.5) what you get is a *summary* written by a second model, not the raw reasoning; no setting restores the full text older models used to print. The summary is enough to tell what it is working on.
+- **`viewMode: "verbose"`** — start every session in verbose mode: thinking blocks are expanded and tool results are shown in full instead of being folded into one line. The same thing per session is `claude --verbose`, the *Verbose output* toggle in `/config`, or `Ctrl+O` while running (in the VS Code extension the key is often taken by the editor; use `/config` there).
+
+Both live in `~/.claude/settings.json` and are read at startup, so restart the session after changing them.
+
+**Does showing it cost tokens?** No. The model produces the same reasoning whether or not it is displayed; these two keys only change what the terminal draws. What *does* change the bill is the reasoning budget: `/effort low|medium|high` in a session, `effortLevel` (or `modelSettings.<model>.effortLevel`) in settings for a default, and words like "think hard" or `ultrathink` in a prompt, which raise it. The Claude 5 models always think; `MAX_THINKING_TOKENS=0` does nothing for them.
+
+**Is it hung?** There is no detector. The token count on the `Thinking…` line should keep growing and tool calls should keep appearing; `/tasks` lists background shells and agents. The `Thought for Ns` counter is unreliable (it resets when you toggle the view) and is not what cct measures — cct takes thinking time from the transcript timestamps. If nothing moves, `Esc` stops the reply and keeps the session.
+
 ### The project slug
 
 The `<slug>` folder name is derived from the absolute project path by replacing **both `/` and `_`** with `-`. Example:
@@ -411,7 +431,7 @@ The by-project, by-date and per-session tables share these columns. Durations pr
 | --- | --- |
 | `sess` | Sessions that contributed to the row. In the by-date table a session that spans two dates counts on both, so the `total` row shows *distinct* sessions rather than the column sum. |
 | `active` | `working + tools + waiting + you`. Everything except breaks — the time somebody (Claude, a tool, or you) was actually busy in the session. |
-| `working` | Gaps that end in Claude's output: from your prompt to its first block, between its blocks, from a tool result to its next block. Thinking is inside this number; the single-session view breaks it out as *of which thinking* when the transcript has per-block lines. Never capped — Claude does not take breaks. |
+| `working` | Gaps that end in Claude's output: from your prompt to its first block, between its blocks, from a tool result to its next block. Thinking is inside this number; the single-session view breaks it out as *of which thinking* when the transcript has per-block lines. Never capped — Claude does not take breaks. To watch that time as it happens rather than read it afterwards, see [`showThinkingSummaries`](#seeing-what-claude-is-doing-showthinkingsummaries-and-verbose-output). |
 | `tools` | Gaps that end in a tool result: the tool running, plus the permission dialog in front of it, which the transcript cannot tell apart. Instant tools (Read, Edit, Write, Glob, Grep, …) slower than `--approve-secs` are counted here but flagged as *likely permission prompts* in the single-session view. |
 | `agents` | Time a background agent or workflow was running while the main thread had nothing to do (otherwise a `you` gap or a break). Overlapping agents count once. The single-session view also shows the number of runs, their total runtime and their cost. |
 | `waiting` | Claude blocked on you: `AskUserQuestion`, `ExitPlanMode` (plan approval), a tool call you declined, or a permission prompt you left with Esc. A permission prompt you *approved* is not here — it is in `tools`, so a zero in this column does not mean you never waited. |
@@ -495,7 +515,7 @@ In the TUI: **Time analytics** (all projects, `v` for by-date; a project or merg
 
 ### `export-prompts.py`
 
-Writes the prompts you typed. Default: one text file per session in `~/cct-export/<project>/` (override with `-o DIR` or `$CCT_EXPORT_DIR`), named `YYYY-MM-DD_HHMM_<shortid>.txt` from the session's local start time. Nothing is ever overwritten: if any target file already exists, the export stops before writing anything, lists the files in the way and exits 3 — pick another folder or move the old files yourself.
+Writes the prompts you typed, each followed by the text of Claude's reply (its text blocks only — thinking, tool calls and tool output are left out; Claude Code's own `<synthetic>` notices such as API errors too). Default: one text file per session in `~/cct-export/<project>/` (override with `-o DIR` or `$CCT_EXPORT_DIR`), named `YYYY-MM-DD_HHMM_<shortid>.txt` from the session's local start time. Nothing is ever overwritten: if any target file already exists, the export stops before writing anything, lists the files in the way and exits 3 — pick another folder or move the old files yourself.
 
 ![Export prompts](images/export-prompts.png)
 
@@ -518,9 +538,19 @@ prompts:  6
 [1] 2026-04-17 15:26:32  (reply 21m03s · 31 tool calls · $5.94)
 add correct gitignore, this where tut it, in project level or root?
 
+--- Claude [1] ---
+Project level — the build output lives under the project folder.
+
+Added .gitignore there with build/, *.stl and the cache folder.
+
 [2] 2026-04-17 15:51:10  (reply 8m14s · 12 tool calls · $2.18)
 list sessions shows command wrapper, not real prompt
+
+--- Claude [2] ---
+Fixed: the list now shows the typed text instead of the wrapper.
 ```
+
+A turn with no text from Claude (only tool calls, or interrupted before it wrote anything) has no `--- Claude ---` block.
 
 `--json` puts everything in one file (`<project>.prompts.json`, or `<start>_<shortid>.json` for `--session`), schema `cct-prompts/1`:
 
@@ -544,13 +574,15 @@ list sessions shows command wrapper, not real prompt
           "ts_approx": false,
           "text": "add correct gitignore, this where tut it, in project level or root?",
           "chars": 67, "words": 13, "lines": 1,
+          "reply": "Project level — the build output lives under the project folder.\n\nAdded .gitignore …",
+          "reply_chars": 120,
           "response_seconds": 1263, "working_seconds": 700,
           "tool_calls": 31, "tools": { "Bash": 12, "Read": 8, "Edit": 7, "Write": 3, "Grep": 1 },
           "cost_usd": 5.94, "cost_agents_usd": 0, "models": ["claude-opus-4-7"],
           "interrupted": false } ] } ] }
 ```
 
-`ts_approx` is true when no typed user event preceded the snapshot (the timestamp is then the nearest earlier event). Times in seconds; `response_seconds` is prompt → Claude's last output of that turn. `cost_usd` includes the background agents started during that turn (`cost_agents_usd` is that part alone).
+`ts_approx` is true when no typed user event preceded the snapshot (the timestamp is then the nearest earlier event). `reply` is Claude's text blocks of that turn joined by a blank line (`""` when there were none). Times in seconds; `response_seconds` is prompt → Claude's last output of that turn. `cost_usd` includes the background agents started during that turn (`cost_agents_usd` is that part alone).
 
 In the TUI: **Export prompts** (pick a project or merged project → format → folder), the same inside a merged project, and **Export prompts of this session** in the session action menu.
 
