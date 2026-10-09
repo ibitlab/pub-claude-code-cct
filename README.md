@@ -166,9 +166,10 @@ one row per turn:
 
 **Export prompts** writes what you typed. By default that is one text file per
 session, named after the session's start time — `2026-04-17_1526_5d35e607.txt`
-— with every prompt verbatim under a timestamped header. Choose JSON instead
-and you get one file for the whole project with, per prompt: UTC and local
-timestamps, text size, how long Claude took to reply, working seconds, tool
+— with every prompt verbatim under a timestamped header, followed by the text
+of Claude's reply. Choose JSON instead and you get one file for the whole
+project with, per prompt: UTC and local timestamps, text size, the reply
+text, how long Claude took to reply, working seconds, tool
 calls by name, estimated cost and models — enough to build your own analytics
 on top. Files go to `~/cct-export/<project>/` unless you type another folder;
 nothing is ever overwritten — if a file is already there, the export stops

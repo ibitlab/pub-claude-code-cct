@@ -466,6 +466,7 @@ class Prompt:
     cost_agents: float = 0.0  # background agents started during this turn
     models: set = field(default_factory=set)
     interrupted: bool = False
+    reply: str = ""           # Claude's text blocks of the turn, in order
 
 
 @dataclass
@@ -481,7 +482,7 @@ class _Actor:
     interrupted: bool = False
     cost: float = 0.0
     model: str | None = None
-    texts: list = field(default_factory=list)   # text blocks of a typed event
+    texts: list = field(default_factory=list)   # text blocks of a typed event / a reply
 
 
 _WS_RE = re.compile(r"\s+")
@@ -733,7 +734,8 @@ def analyze_session(path: Path, break_secs: float = DEFAULT_BREAK_SECS,
                 msg_model[mid] = model
             actors.append(_Actor(ts=ts, kind="A", mid=mid,
                                  thinking_only=bool(kinds) and all(k == "thinking" for k in kinds),
-                                 tool_uses=uses, stop=msg.get("stop_reason"), model=model))
+                                 tool_uses=uses, stop=msg.get("stop_reason"), model=model,
+                                 texts=[b.get("text", "") for b in blocks if b.get("type") == "text"]))
             continue
         # user
         if _is_tool_result(ev, content):
@@ -878,10 +880,15 @@ def analyze_session(path: Path, break_secs: float = DEFAULT_BREAK_SECS,
         span = actors[p.start:p.end]
         last_a = None
         turn_mids: set = set()
+        reply: list = []
         for j, ac in enumerate(span):
             idx = p.start + j
             if ac.kind == "A":
                 last_a = ac.ts
+                # "<synthetic>" lines are Claude Code's own notices (API
+                # errors, usage limits), not Claude's words.
+                if not (ac.model or "").startswith("<"):
+                    reply += [t.strip("\n") for t in ac.texts if t.strip()]
                 if ac.mid not in turn_mids:
                     turn_mids.add(ac.mid)
                     p.cost += msg_cost.get(ac.mid, 0.0)
@@ -893,6 +900,7 @@ def analyze_session(path: Path, break_secs: float = DEFAULT_BREAK_SECS,
                 p.interrupted = True
             if idx in working_gap:
                 p.working_secs += working_gap[idx]
+        p.reply = "\n\n".join(reply)
         if p.ts is not None and last_a is not None and last_a >= p.ts:
             p.response_secs = last_a - p.ts
 

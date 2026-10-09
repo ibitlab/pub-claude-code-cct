@@ -3,12 +3,14 @@
 
 Default: one plain-text file per session, named after the session's local
 start time plus its short id — 2026-04-17_1526_5d35e607.txt — each prompt
-verbatim under a timestamped header.
+verbatim under a timestamped header, followed by the text of Claude's reply
+(its text blocks only; thinking, tool calls and tool output are left out).
 
 --json: everything in one JSON file instead, with per-prompt properties for
-your own analytics: timestamp (UTC + local), text size, how long Claude took
-to reply, working seconds, tool calls by name, estimated cost, models,
-whether you interrupted it; plus per-session time buckets and totals.
+your own analytics: timestamp (UTC + local), text size, the reply text, how
+long Claude took to reply, working seconds, tool calls by name, estimated
+cost, models, whether you interrupted it; plus per-session time buckets and
+totals.
 
 Usage:
   ./export-prompts.py <project> [-o DIR] [--json]
@@ -54,6 +56,8 @@ def prompt_json(p: L.Prompt) -> dict:
         "chars": len(p.text),
         "words": len(p.text.split()),
         "lines": p.text.count("\n") + 1,
+        "reply": p.reply,
+        "reply_chars": len(p.reply),
         "response_seconds": round(p.response_secs) if p.response_secs is not None else None,
         "working_seconds": round(p.working_secs),
         "tool_calls": sum(p.tools.values()),
@@ -113,6 +117,10 @@ def session_text(a: L.SessionAnalysis) -> str:
         lines.append(f"[{p.n}] {when}{meta}")
         lines.append(p.text.rstrip("\n"))
         lines.append("")
+        if p.reply:
+            lines.append(f"--- Claude [{p.n}] ---")
+            lines.append(p.reply)
+            lines.append("")
     return "\n".join(lines) + "\n"
 
 

@@ -1295,9 +1295,9 @@ Menus:
                    permission dialog counts as tools, not waiting, and "you"
                    is the gap to your next prompt, not observed presence;
                    every table repeats both caveats underneath.
-  Export prompts   Your typed prompts, one text file per session
-                   (YYYY-MM-DD_HHMM_<id>.txt) or one JSON with per-prompt
-                   timestamps, reply time, tool calls and cost.
+  Export prompts   Your typed prompts with Claude's replies, one text file
+                   per session (YYYY-MM-DD_HHMM_<id>.txt) or one JSON with
+                   per-prompt timestamps, reply time, tool calls and cost.
 
 Scripts invoked under the hood live next to this file and can be used
 standalone: list-sessions.sh, session-stats.sh, session-tools.sh,
